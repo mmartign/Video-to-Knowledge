@@ -139,9 +139,3 @@ Contributions are welcome—especially around:
 - GitHub: `github.com/mmartign/Video-to-Knowledge` 
 - Contact: `info@spazioit.com`
 - Website: `spazioit.com`  
-
----
-
-## Reference
-
-- Attached system overview (January 2026).
