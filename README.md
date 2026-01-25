@@ -133,12 +133,6 @@ Contributions are welcome—especially around:
 
 ---
 
-## License
-
-This project is described as **open-source**.  
-Add your chosen license text in `LICENSE` (e.g., MIT, Apache-2.0, GPL-3.0).
-
----
 
 ## Contacts
 
