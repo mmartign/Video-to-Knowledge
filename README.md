@@ -139,9 +139,9 @@ You are free to use, modify, and redistribute this software under the terms of t
 A copy of the license should be included with this repository. If not, see the full license text at:
 https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
 
+---
 
 ## Contacts
-
-- GitHub: https://github.com/mmartign/Video-to-Knowledge 
-- Contact: Maurizio.Martignano@spazioit.com
+- Mail: Maurizio.Martignano@spazioit.com
 - Website: https://spazioit.com/pages_en/sol_inf_en/si-watcher  
+- GitHub: https://github.com/mmartign/Video-to-Knowledge 
