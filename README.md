@@ -142,6 +142,6 @@ https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
 
 ## Contacts
 
-- GitHub: `github.com/mmartign/Video-to-Knowledge` 
+- GitHub: https://github.com/mmartign/Video-to-Knowledge 
 - Contact: Maurizio.Martignano@spazioit.com
-- Website: http://spazioit.com/  
+- Website: https://spazioit.com/pages_en/sol_inf_en/si-watcher  
