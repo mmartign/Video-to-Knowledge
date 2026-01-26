@@ -143,5 +143,5 @@ https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
 ## Contacts
 
 - GitHub: `github.com/mmartign/Video-to-Knowledge` 
-- Contact: `info@spazioit.com`
-- Website: `spazioit.com`  
+- Contact: Maurizio.Martignano@spazioit.com
+- Website: http://spazioit.com/  
