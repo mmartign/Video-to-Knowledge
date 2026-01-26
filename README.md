@@ -133,6 +133,12 @@ Contributions are welcome—especially around:
 
 ---
 
+📄 **License**
+This project is released under the GNU General Public License, version 2 (GPL-2.0).
+You are free to use, modify, and redistribute this software under the terms of the GPL-2.0. Any derivative work must also be distributed under the same license.
+A copy of the license should be included with this repository. If not, see the full license text at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
 
 ## Contacts
 
