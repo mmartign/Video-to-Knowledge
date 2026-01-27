@@ -36,6 +36,8 @@
 #include <cctype>
 #include <cstdint>
 #include <cmath>
+#include <filesystem>
+#include <iomanip>
 #include <openai.hpp>
 #include <nlohmann/json.hpp>
 
@@ -191,6 +193,34 @@ static std::string extractMessageText(const json& response)
     return {};
 }
 
+static std::string formatDateTime(const std::chrono::system_clock::time_point& tp)
+{
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm = *std::localtime(&t);
+    std::ostringstream oss;
+    oss << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << ']';
+    return oss.str();
+}
+
+static bool parseDateTime(const std::string& s, std::chrono::system_clock::time_point& out)
+{
+    std::tm tm{};
+    std::istringstream iss(s);
+    iss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+    if (iss.fail()) return false;
+    std::time_t tt = std::mktime(&tm);
+    if (tt == -1) return false;
+    out = std::chrono::system_clock::from_time_t(tt);
+    return true;
+}
+
+static std::chrono::system_clock::time_point fileTimeToSystemClock(const std::filesystem::file_time_type& ftime)
+{
+    using namespace std::chrono;
+    // Use the standard conversion to avoid clock skew errors.
+    return time_point_cast<system_clock::duration>(file_clock::to_sys(ftime));
+}
+
 static cv::Mat resizeMaxDim(const cv::Mat& frame, int maxDim)
 {
     if (maxDim <= 0) return frame;
@@ -227,7 +257,7 @@ static bool sendFrameToOpenAI(
         params = {cv::IMWRITE_JPEG_QUALITY, jpegQuality};
     }
     if (!cv::imencode(".jpg", resized, buffer, params)) {
-        std::cerr << "[ERROR] Trigger #" << triggerIdx << " failed to encode frame to JPEG\n";
+        std::cerr << "[ERROR] Interval #" << triggerIdx << " failed to encode frame to JPEG\n";
         return false;
     }
 
@@ -239,7 +269,7 @@ static bool sendFrameToOpenAI(
             {
                 {"role", "user"},
                 {"content", json::array({
-                    {{"type", "text"}, {"text", prompt + " Wall time: " + std::to_string(wallTimeSec) + "s; trigger #" + std::to_string(triggerIdx)}},
+                    {{"type", "text"}, {"text", prompt + " Wall time: " + std::to_string(wallTimeSec) + "s; interval #" + std::to_string(triggerIdx)}},
                     {{"type", "image_url"}, {"image_url", {{"url", dataUrl}}}}
                 })}
             }
@@ -257,7 +287,7 @@ static bool sendFrameToOpenAI(
         }
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[ERROR] OpenAI request failed for trigger #" << triggerIdx << ": " << e.what() << "\n";
+        std::cerr << "[ERROR] OpenAI request failed for interval #" << triggerIdx << ": " << e.what() << "\n";
         // If you want deeper debugging, uncomment:
         // std::cerr << "[DEBUG] Raw response json: " << chat.dump(2) << "\n";
         return false;
@@ -269,12 +299,13 @@ static void printUsage(const char* argv0)
     std::cerr
         << "Usage: " << argv0 << " <video_or_stream_uri> [config.ini] [options]\n"
         << "Options (defaults match current hardcoded behavior):\n"
-        << "  --interval <sec>        Trigger interval in seconds (default 10)\n"
+        << "  --interval <sec>        Prompt repetition interval in seconds (default 10)\n"
         << "  --max-dim <px>          Resize frames so max(width,height)<=px (default 1024)\n"
         << "  --jpeg-quality <1-100>  JPEG quality (default 85)\n"
         << "  --prompt <text>         Prompt prefix (default: \"Analyze this frame.\")\n"
         << "  --no-gui                Disable OpenCV imshow/waitKey\n"
-        << "  --reconnect-sec <sec>   Reconnect window for live streams (default 5)\n";
+        << "  --reconnect-sec <sec>   Reconnect window for live streams (default 5)\n"
+        << "  --encoded-start \"YYYY-mm-dd HH:MM:SS\"  Override encoded/base datetime for media files\n";
 }
 
 static bool isSingleDigitIndex(const std::string& s)
@@ -311,6 +342,8 @@ int main(int argc, char** argv)
     std::string prompt = "Analyze this frame.";
     bool guiEnabled = true;
     int reconnectSec = 5;
+    bool hasEncodedStart = false;
+    std::chrono::system_clock::time_point encodedStart;
 
     // Parse options (after src and optional config.ini)
     int optStart = 2;
@@ -342,6 +375,14 @@ int main(int argc, char** argv)
                 std::cerr << "[ERROR] --jpeg-quality must be 1..100\n";
                 return 1;
             }
+        } else if (a == "--encoded-start") {
+            const char* v = needVal("--encoded-start");
+            if (!v) return 1;
+            if (!parseDateTime(v, encodedStart)) {
+                std::cerr << "[ERROR] --encoded-start expects \"YYYY-mm-dd HH:MM:SS\"\n";
+                return 1;
+            }
+            hasEncodedStart = true;
         } else if (a == "--prompt") {
             const char* v = needVal("--prompt");
             if (!v) return 1;
@@ -386,15 +427,29 @@ int main(int argc, char** argv)
     // For files, end-of-stream is expected; for streams, try reconnect briefly.
     const double frameCount = cap.get(cv::CAP_PROP_FRAME_COUNT);
     const bool likelyFile = std::isfinite(frameCount) && frameCount > 0.0 && !isSingleDigitIndex(src);
+    std::chrono::system_clock::time_point fileBaseTime = std::chrono::system_clock::now();
+    if (likelyFile) {
+        if (hasEncodedStart) {
+            fileBaseTime = encodedStart;
+        } else {
+            std::error_code ec;
+            auto ft = std::filesystem::last_write_time(src, ec);
+            if (!ec) {
+                fileBaseTime = fileTimeToSystemClock(ft);
+            }
+        }
+    }
 
     std::mutex frameMtx;
     cv::Mat latestFrame;
+    double latestMediaPosSec = 0.0;
     std::atomic<bool> running{true};
 
     // Pending (single-slot) inference request: newest wins.
     struct PendingJob {
         cv::Mat frame;
         double wallTimeSec = 0.0;
+        double mediaPosSec = 0.0;
         int triggerIdx = 0;
         bool has = false;
     };
@@ -420,8 +475,18 @@ int main(int argc, char** argv)
             }
 
             if (!job.frame.empty()) {
-                std::cout << "[TRIGGER #" << job.triggerIdx << "] wall t=" << job.wallTimeSec
-                          << "s  frame=" << job.frame.cols << "x" << job.frame.rows << std::endl;
+                auto now = std::chrono::system_clock::now();
+                std::string timeTag;
+                if (likelyFile) {
+                    auto encodedTp = fileBaseTime + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                        std::chrono::duration<double>(job.wallTimeSec));
+                    timeTag = formatDateTime(encodedTp);
+                } else {
+                    timeTag = formatDateTime(now);
+                }
+
+                std::cout << timeTag << " [INTERVAL #" << job.triggerIdx << "] frame="
+                          << job.frame.cols << "x" << job.frame.rows << std::endl;
 
                 sendFrameToOpenAI(job.frame, job.wallTimeSec, job.triggerIdx, cfg, prompt, maxDim, jpegQuality);
             }
@@ -440,10 +505,6 @@ int main(int argc, char** argv)
 
         while (running.load()) {
             if (cap.read(f) && !f.empty()) {
-                {
-                    std::lock_guard<std::mutex> lock(frameMtx);
-                    f.copyTo(latestFrame);
-                }
                 lastOk = std::chrono::steady_clock::now();
 
                 // For files, throttle reads to approximate real-time playback
@@ -465,6 +526,12 @@ int main(int argc, char** argv)
                             std::this_thread::sleep_for(targetTime - now);
                         }
                     }
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(frameMtx);
+                    f.copyTo(latestFrame);
+                    latestMediaPosSec = fallbackPosSec;
                 }
                 continue;
             }
@@ -504,12 +571,14 @@ int main(int argc, char** argv)
         const auto tNow = std::chrono::steady_clock::now();
         const double wallSec = std::chrono::duration<double>(tNow - t0).count();
 
-        // Trigger every intervalSec; queue newest only
+        // Repeat prompt every intervalSec; queue newest only
         if (wallSec >= nextTrigger) {
             cv::Mat frameCopy;
+            double mediaPosSec = 0.0;
             {
                 std::lock_guard<std::mutex> lock(frameMtx);
                 if (!latestFrame.empty()) latestFrame.copyTo(frameCopy);
+                mediaPosSec = latestMediaPosSec;
             }
 
             if (!frameCopy.empty()) {
@@ -517,6 +586,7 @@ int main(int argc, char** argv)
                     std::lock_guard<std::mutex> lk(jobMtx);
                     pending.frame = frameCopy;          // overwrite slot
                     pending.wallTimeSec = wallSec;
+                    pending.mediaPosSec = mediaPosSec;
                     pending.triggerIdx = triggerIdx++;
                     pending.has = true;
                 }
