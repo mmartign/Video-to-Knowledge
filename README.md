@@ -1,106 +1,123 @@
-# SI-Watcher — Real-Time Video-to-Knowledge Engine on the Edge
+# SI-Watcher  
+### Real-Time Video-to-Knowledge Engine for Edge AI
 
-SI-Watcher is an edge-first, real-time **video-to-knowledge** pipeline that ingests live or recorded video streams, periodically samples frames, and uses **multimodal Generative AI** to extract **structured insights** locally and securely.
+**SI-Watcher** is an edge-first, real-time **video-to-knowledge pipeline** designed to transform live or recorded video streams into **structured, actionable insights** using **multimodal Generative AI**—securely, locally, and with ultra-low latency.
 
-> **Design goals:** low-latency decisions, privacy-first processing, and cloud-independence. 
+The system has been **explicitly designed for healthcare applications**, where privacy, reliability, and real-time decision support are critical, and has been **tested and validated with the MedGemma-15:4b multimodal model** for medical-grade vision-language inference.
+
+> **Design goals:** low latency, privacy-first processing, deterministic behavior, and full cloud independence.
 
 ---
 
-## What it does
+## What SI-Watcher does
 
-- **Ingests** live video (cameras/streams) or video files  
+- **Ingests video** from live cameras, network streams, or recorded files  
 - **Samples frames** at configurable, time-based intervals (trigger-style sampling)  
-- Runs **contextual vision analysis** with multimodal GenAI (images + prompts)  
-- Produces **structured output** in (near) real time on an edge device  
+- Performs **context-aware vision analysis** using multimodal GenAI (images + prompts)  
+- Generates **structured outputs** in (near) real time directly on edge hardware  
 
 ---
 
 ## Core capabilities
 
-- Live video ingestion (cameras, streams, video files)  
-- Adaptive frame sampling (time-based triggers)  
-- Contextual vision analysis (GenAI with images + prompts)  
-- Edge-first architecture (single industrial PC)  
-- Open-source and configurable  
+- Live video ingestion (RTSP/HTTP streams, USB cameras, video files)  
+- Adaptive, time-based frame sampling  
+- Multimodal GenAI inference (vision + language)  
+- Edge-first architecture (single industrial or medical-grade PC)  
+- Fully open-source and highly configurable  
+
+---
+
+## Healthcare-first by design
+
+SI-Watcher was architected with **healthcare environments** in mind, including:
+
+- **Patient privacy preservation** (no mandatory cloud dependency)  
+- **On-premise deployment** in hospitals, clinics, and laboratories  
+- **Low-latency decision support** for time-critical scenarios  
+- **Auditability and structured outputs** suitable for clinical workflows  
+
+The pipeline has been **tested with MedGemma-15:4b**, confirming compatibility with medical multimodal models for observational analysis, contextual interpretation, and structured reporting.
+
+> While healthcare is a primary focus, the architecture remains domain-agnostic and adaptable to other safety-critical environments.
 
 ---
 
 ## Key innovations
 
-- Multimodal GenAI applied directly to video frames 
-- Non-blocking pipeline with frame dropping for responsiveness 
-- Edge-optimized JPEG encoding and adaptive resizing 
-- Seamless live-stream reconnection handling 
-- CLI-first, automation-friendly design 
+- Multimodal GenAI applied directly to sampled video frames  
+- Non-blocking, resilient pipeline with frame dropping under load  
+- Edge-optimized JPEG encoding with adaptive resizing  
+- Robust live-stream reconnection handling  
+- CLI-first, automation-friendly design  
 
 ---
 
-## Why edge deployment?
+## Why deploy on the edge?
 
-- No dependency on cloud   
-- Privacy-first: sensitive data stays local   
-- Ultra-low latency for real-time decisions   
-- Works offline / low-connectivity environments   
+- **No cloud dependency**  
+- **Privacy-first**: sensitive visual data remains local  
+- **Ultra-low latency** for real-time interpretation  
+- **Offline-capable** and resilient to poor connectivity  
 
 ---
 
 ## Technical highlights
 
-- OpenCV-based capture and rendering  
-- Multithreaded pipeline (capture, inference, UI)  
-- JPEG compression with adaptive resizing  
-- OpenAI-compatible vision API integration  
-- Production-grade error handling  
+- OpenCV-based video capture and rendering  
+- Multithreaded pipeline (capture, sampling, inference, UI/output)  
+- Adaptive JPEG compression and resizing  
+- OpenAI-compatible multimodal vision API integration  
+- Production-grade error handling and recovery  
 
 ---
 
-## Example use case (industrial monitoring)
+## Example use case (healthcare monitoring)
 
-1. A camera observes an industrial process  
+1. A camera observes a clinical or laboratory environment  
 2. SI-Watcher samples a frame every **N seconds**  
-3. GenAI interprets visual context (e.g., detects an anomaly)  
-4. Structured output is logged or forwarded via API  
-5. A human operator remains in the loop  
+3. A multimodal GenAI model (e.g. **MedGemma-15:4b**) interprets visual context  
+4. Structured insights are generated (events, summaries, confidence scores)  
+5. Clinicians or operators remain in the loop for validation and action  
 
 ---
 
 ## Potential application domains
 
-- Industrial monitoring & inspections  
+- **Healthcare and clinical observation**  
+- Medical device and procedure monitoring  
+- Laboratory and research environments  
+- Industrial monitoring and inspections  
 - Smart surveillance and safety systems  
 - Manufacturing quality control  
-- Research and laboratory observation  
-- Remote site supervision  
 
 ---
 
 ## Architecture (high level)
 
-A typical deployment runs on a single edge/industrial PC:
+A typical deployment runs on a single edge or industrial PC:
 
-1. **Capture** (OpenCV) → read stream, handle reconnections  
-2. **Sampler** → time-based triggers; may drop frames when overloaded  
-3. **Preprocess** → resize + JPEG encode for efficiency  
-4. **Inference** → multimodal GenAI call (OpenAI-compatible vision API)  
-5. **Output** → structured events (log/file/API)  
-
----
-
-
-
-### Configuration ideas
-
-- `--source`: RTSP/HTTP stream, device index, or video file  
-- `--interval`: sampling cadence (seconds)  
-- `--max-width/--max-height` or `--resize`: preprocessing constraints  
-- `--drop-frames`: keep pipeline responsive under load  
-- `--vision-endpoint` + `--api-key`: OpenAI-compatible vision API integration  
+1. **Capture** → OpenCV video ingestion with reconnection handling  
+2. **Sampler** → time-based triggers with optional frame dropping  
+3. **Preprocessing** → resize and JPEG encode for efficiency  
+4. **Inference** → multimodal GenAI (OpenAI-compatible API)  
+5. **Output** → structured events (log, file, or API sink)  
 
 ---
 
-## Output format (recommended)
+## Configuration highlights
 
-While the deck states “structured insights”, a practical format is JSON Lines (`.jsonl`) with a schema like:
+- `--source` — RTSP/HTTP stream, device index, or video file  
+- `--interval` — frame sampling cadence (seconds)  
+- `--max-width / --max-height` or `--resize` — preprocessing constraints  
+- `--drop-frames` — maintain responsiveness under load  
+- `--vision-endpoint` + `--api-key` — OpenAI-compatible vision API  
+
+---
+
+## Recommended output format
+
+Structured outputs are typically emitted as **JSON Lines (`.jsonl`)**, for easy ingestion by downstream systems:
 
 ```json
 {
@@ -108,40 +125,14 @@ While the deck states “structured insights”, a practical format is JSON Line
   "source": "camera-1",
   "frame_id": 1842,
   "labels": ["anomaly"],
-  "summary": "Possible blockage detected near conveyor intake.",
+  "summary": "Possible obstruction detected near monitored area.",
   "confidence": 0.78,
   "evidence": {
     "prompt": "…",
-    "model": "…",
+    "model": "MedGemma-15:4b",
     "image": {
       "width": 1280,
       "height": 720
     }
   }
 }
-```
-
----
-
-## Contributing
-
-Contributions are welcome—especially around:
-- new sampling triggers,
-- additional output sinks (MQTT/REST/Webhooks),
-- prompt packs for specific domains,
-- benchmarking and edge optimizations.  
-
----
-
-📄 **License**
-This project is released under the GNU General Public License, version 2 (GPL-2.0).
-You are free to use, modify, and redistribute this software under the terms of the GPL-2.0. Any derivative work must also be distributed under the same license.
-A copy of the license should be included with this repository. If not, see the full license text at:
-https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
-
----
-
-## Contacts
-- Mail: Maurizio.Martignano@spazioit.com
-- Website: https://spazioit.com/pages_en/sol_inf_en/si-watcher  
-- GitHub: https://github.com/mmartign/Video-to-Knowledge 
