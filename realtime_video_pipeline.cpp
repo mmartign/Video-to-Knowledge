@@ -281,9 +281,9 @@ static bool sendFrameToOpenAI(
         auto chat = openai::chat().create(body);
         const std::string message = extractMessageText(chat);
         if (!message.empty()) {
-            std::cout << "[AI RESPONSE #" << triggerIdx << "] " << message << std::endl;
+            std::cout << message << std::endl;
         } else {
-            std::cout << "[AI RESPONSE #" << triggerIdx << "] (no text content)" << std::endl;
+            std::cout << "(no text content)" << std::endl;
         }
         return true;
     } catch (const std::exception& e) {
@@ -485,8 +485,7 @@ int main(int argc, char** argv)
                     timeTag = formatDateTime(now);
                 }
 
-                std::cout << timeTag << " [INTERVAL #" << job.triggerIdx << "] frame="
-                          << job.frame.cols << "x" << job.frame.rows << std::endl;
+                std::cout << timeTag << "  ";
 
                 sendFrameToOpenAI(job.frame, job.wallTimeSec, job.triggerIdx, cfg, prompt, maxDim, jpegQuality);
             }
@@ -564,7 +563,7 @@ int main(int argc, char** argv)
     });
 
     const auto t0 = std::chrono::steady_clock::now();
-    double nextTrigger = intervalSec;
+    double nextTrigger = 0.0;
     int triggerIdx = 0;
 
     while (running.load()) {
@@ -591,9 +590,9 @@ int main(int argc, char** argv)
                     pending.has = true;
                 }
                 jobCv.notify_one();
-            }
 
-            while (wallSec >= nextTrigger) nextTrigger += intervalSec;
+                while (wallSec >= nextTrigger) nextTrigger += intervalSec;
+            }
         }
 
         // Optional display (non-blocking)
