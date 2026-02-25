@@ -115,6 +115,7 @@ A typical deployment runs on a single edge or industrial PC:
 
 ---
 
-## License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+📄 **License**
+This project is released under the MIT License.
+You are free to use, modify, and redistribute this software under the terms of the MIT License.
+See the [LICENSE](LICENSE) file for the full text.
