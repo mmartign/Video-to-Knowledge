@@ -115,30 +115,6 @@ A typical deployment runs on a single edge or industrial PC:
 
 ---
 
-## Recommended output format
-
-Structured outputs are typically emitted as **JSON Lines (`.jsonl`)**, for easy ingestion by downstream systems:
-
-```json
-{
-  "ts": "2026-01-25T10:15:04Z",
-  "source": "camera-1",
-  "frame_id": 1842,
-  "labels": ["anomaly"],
-  "summary": "Possible obstruction detected near monitored area.",
-  "confidence": 0.78,
-  "evidence": {
-    "prompt": "…",
-    "model": "MedGemma-15:4b",
-    "image": {
-      "width": 1280,
-      "height": 720
-    }
-  }
-}
-
----
-
 ## License
 
 This project is licensed under the MIT License. See the `LICENSE` file for details.
