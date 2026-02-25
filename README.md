@@ -119,3 +119,26 @@ A typical deployment runs on a single edge or industrial PC:
 This project is released under the MIT License.
 You are free to use, modify, and redistribute this software under the terms of the MIT License.
 See the [LICENSE](LICENSE) file for the full text.
+
+---
+
+## 🏢 About Spazio IT
+
+Spazio - IT Soluzioni Informatiche s.a.s.\
+via Manzoni 40\
+46051 San Giorgio Bigarello\
+Italy
+
+https://spazioit.com
+
+Part of the **OR-Edge Project** --- AI-powered solutions for medical
+edge environments.
+
+---
+
+## ⚠ Disclaimer
+
+This software is provided **without warranty**.\
+It is intended for research, validation, and controlled medical IT
+environments.\
+It does not replace certified medical decision systems.
