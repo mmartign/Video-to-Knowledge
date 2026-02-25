@@ -136,3 +136,9 @@ Structured outputs are typically emitted as **JSON Lines (`.jsonl`)**, for easy 
     }
   }
 }
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the `LICENSE` file for details.
