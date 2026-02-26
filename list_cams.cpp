@@ -2,7 +2,7 @@
 //
 // This file is part of the Spazio IT Video-to-Knowledge project.
 //
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: CC-BY-4.0
 //
 // Copyright (c) 2026 Spazio IT
 // Spazio - IT Soluzioni Informatiche s.a.s.

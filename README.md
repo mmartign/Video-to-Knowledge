@@ -116,9 +116,9 @@ A typical deployment runs on a single edge or industrial PC:
 ---
 
 📄 **License**
-This project is released under the MIT License.
-You are free to use, modify, and redistribute this software under the terms of the MIT License.
-See the [LICENSE](LICENSE) file for the full text.
+This project is released under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
+You are free to share and adapt the material, including for commercial use, with proper attribution.
+See the [LICENSE](LICENSE) file for the full text and terms.
 
 ---
 
