@@ -3,7 +3,7 @@
 
 **SI-Watcher** is an edge-first, real-time **video-to-knowledge pipeline** designed to transform live or recorded video streams into **structured, actionable insights** using **multimodal Generative AI**—securely, locally, and with ultra-low latency.
 
-The system has been **explicitly designed for healthcare applications**, where privacy, reliability, and real-time decision support are critical, and has been **tested and validated with the MedGemma-15:4b multimodal model** for medical-grade vision-language inference.
+The system has been **explicitly designed for healthcare applications**, where privacy, reliability, and real-time decision support are critical, and has been **tested and validated with the MedGemma-1.5:4b multimodal model** for medical-grade vision-language inference.
 
 > **Design goals:** low latency, privacy-first processing, deterministic behavior, and full cloud independence.
 
