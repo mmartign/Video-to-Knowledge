@@ -37,7 +37,7 @@ SI-Watcher was architected with **healthcare environments** in mind, including:
 - **Low-latency decision support** for time-critical scenarios  
 - **Auditability and structured outputs** suitable for clinical workflows  
 
-The pipeline has been **tested with MedGemma-15:4b**, confirming compatibility with medical multimodal models for observational analysis, contextual interpretation, and structured reporting.
+The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility with medical multimodal models for observational analysis, contextual interpretation, and structured reporting.
 
 > While healthcare is a primary focus, the architecture remains domain-agnostic and adaptable to other safety-critical environments.
 
