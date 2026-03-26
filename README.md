@@ -116,8 +116,8 @@ A typical deployment runs on a single edge or industrial PC:
 ---
 
 📄 **License**
-This project is released under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
-You are free to share and adapt the material, including for commercial use, with proper attribution.
+This project is released under the GNU Affero General Public License v3.0 (AGPL-3.0-or-later).
+You may copy, modify, and redistribute it under the AGPL terms, including source disclosure obligations for network use.
 See the [LICENSE](LICENSE) file for the full text and terms.
 
 ---
