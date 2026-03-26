@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+
 # SI-Watcher  
 ### Real-Time Video-to-Knowledge Engine for Edge AI
 
