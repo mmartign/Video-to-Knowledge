@@ -11,83 +11,222 @@
 // https://spazioit.com
 //
 #include <opencv2/opencv.hpp>
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <vector>
-#include <string>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <chrono>
-#include <cctype>
-#include <cstdint>
-#include <cmath>
-#include <filesystem>
-#include <iomanip>
 #include <openai.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cctype>
+#include <cstdint>
+#include <ctime>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
 using json = nlohmann::json;
 
+//------------------------------------------------------------------------------
+// Configuration and runtime option structures
+//------------------------------------------------------------------------------
+
+// OpenAI-related configuration loaded from the INI file.
 struct OpenAIConfig {
     std::string baseUrl;
     std::string apiKey;
     std::string vmodelName;
 };
 
+// Command-line options with defaults chosen to match the original behavior.
+struct ProgramOptions {
+    std::string src;
+    std::string configPath = "config.ini";
+
+    double intervalSec = 10.0;
+    int maxDim = 1024;
+    int jpegQuality = 85;
+    std::string prompt = "Analyze this frame.";
+    bool guiEnabled = true;
+    int reconnectSec = 5;
+
+    // Optional explicit base datetime for media files.
+    // If absent, we fall back to the file modification time when possible.
+    bool hasEncodedStart = false;
+    std::chrono::system_clock::time_point encodedStart{};
+};
+
+// Single-slot job exchanged between the main thread and the inference worker.
+//
+// Design choice:
+// - We keep only one pending job.
+// - Newer frames overwrite older pending work.
+// - This keeps the pipeline responsive for live streams and prevents latency
+//   from growing without bound under slow inference.
+struct PendingJob {
+    cv::Mat frame;
+    double wallTimeSec = 0.0;   // elapsed program time when the trigger fired
+    double mediaPosSec = 0.0;   // position in the media timeline, if known
+    int triggerIdx = 0;
+    bool has = false;
+    bool stop = false;
+};
+
+//------------------------------------------------------------------------------
+// Utility helpers
+//------------------------------------------------------------------------------
+
+// Simple RAII joiner to ensure threads are joined on all exit paths.
+class ThreadJoiner {
+public:
+    explicit ThreadJoiner(std::thread& t) noexcept : thread_(t) {}
+    ThreadJoiner(const ThreadJoiner&) = delete;
+    ThreadJoiner& operator=(const ThreadJoiner&) = delete;
+
+    ~ThreadJoiner() {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    std::thread& thread_;
+};
+
+// Print CLI help.
+static void printUsage(const char* argv0)
+{
+    std::cerr
+        << "Usage: " << argv0 << " <video_or_stream_uri> [config.ini] [options]\n"
+        << "Options:\n"
+        << "  --interval <sec>        Prompt repetition interval in seconds (default 10)\n"
+        << "  --max-dim <px>          Resize frames so max(width,height)<=px (default 1024)\n"
+        << "  --jpeg-quality <1-100>  JPEG quality (default 85)\n"
+        << "  --prompt <text>         Prompt prefix (default: \"Analyze this frame.\")\n"
+        << "  --no-gui                Disable OpenCV imshow/waitKey\n"
+        << "  --reconnect-sec <sec>   Reconnect window for live streams (default 5)\n"
+        << "  --encoded-start \"YYYY-mm-dd HH:MM:SS\"\n"
+        << "                          Override encoded/base datetime for media files\n";
+}
+
+// Trim leading and trailing whitespace in place.
+// Returns false if the resulting string is empty.
+static bool trimInPlace(std::string& s)
+{
+    const auto start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        s.clear();
+        return false;
+    }
+
+    const auto end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(start, end - start + 1);
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// INI/config parsing
+//------------------------------------------------------------------------------
+
+// Small INI parser.
+//
+// Supported features:
+// - [section] headers
+// - key=value pairs
+// - full-line comments starting with ';' or '#'
+//
+// Deliberately not supported:
+// - quoted escaping rules
+// - inline comments
+// - multi-line values
+//
+// This keeps the parser predictable and avoids corrupting values containing
+// '#' or ';', which the previous version could truncate accidentally.
 static std::map<std::string, std::string> parseIni(const std::string& filename)
 {
     std::ifstream file(filename);
     std::map<std::string, std::string> config;
-    if (!file.is_open()) return config;
+    if (!file.is_open()) {
+        return config;
+    }
 
-    std::string line, section;
+    std::string line;
+    std::string section;
+
     while (std::getline(file, line)) {
-        const size_t commentPos = line.find_first_of(";#");
-        if (commentPos != std::string::npos) line = line.substr(0, commentPos);
+        if (!trimInPlace(line)) {
+            continue;
+        }
 
-        const auto start = line.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) continue;
-        line.erase(0, start);
-        const auto end = line.find_last_not_of(" \t\r\n");
-        if (end != std::string::npos) line.erase(end + 1);
+        if (line.empty()) {
+            continue;
+        }
 
+        // Only treat comment markers as comments when they begin the line.
+        // This is simpler and safer than trying to strip inline comments.
+        if (line[0] == ';' || line[0] == '#') {
+            continue;
+        }
+
+        // Section header: [openai]
         if (line.front() == '[' && line.back() == ']') {
             section = line.substr(1, line.size() - 2);
+            trimInPlace(section);
             continue;
         }
 
         const size_t eqPos = line.find('=');
-        if (eqPos == std::string::npos) continue;
+        if (eqPos == std::string::npos) {
+            continue;
+        }
 
         std::string key = line.substr(0, eqPos);
         std::string value = line.substr(eqPos + 1);
-        key.erase(0, key.find_first_not_of(" \t\r\n"));
-        key.erase(key.find_last_not_of(" \t\r\n") + 1);
-        value.erase(0, value.find_first_not_of(" \t\r\n"));
-        value.erase(value.find_last_not_of(" \t\r\n") + 1);
 
-        if (!section.empty()) key = section + "." + key;
+        if (!trimInPlace(key)) {
+            continue;
+        }
+        trimInPlace(value);
+
+        // Flatten sections into "section.key".
+        if (!section.empty()) {
+            key = section + "." + key;
+        }
+
         config[key] = value;
     }
+
     return config;
 }
 
+// Ensure base URLs end with '/' so downstream URL construction is consistent.
 static std::string ensureTrailingSlash(const std::string& url)
 {
-    if (url.empty() || url.back() == '/') return url;
+    if (url.empty() || url.back() == '/') {
+        return url;
+    }
     return url + "/";
 }
 
+// Load and validate the required OpenAI config values.
 static bool loadOpenAIConfig(const std::string& path, OpenAIConfig& cfg)
 {
     const auto config = parseIni(path);
+
     auto getValue = [&](const std::string& key, std::string& out) {
         const auto it = config.find(key);
-        if (it != config.end()) out = it->second;
+        if (it != config.end()) {
+            out = it->second;
+        }
     };
 
     getValue("openai.base_url", cfg.baseUrl);
@@ -95,13 +234,21 @@ static bool loadOpenAIConfig(const std::string& path, OpenAIConfig& cfg)
     getValue("openai.vmodel_name", cfg.vmodelName);
 
     std::vector<std::string> missing;
-    if (cfg.baseUrl.empty()) missing.push_back("openai.base_url");
-    if (cfg.apiKey.empty()) missing.push_back("openai.api_key");
-    if (cfg.vmodelName.empty()) missing.push_back("openai.vmodel_name");
+    if (cfg.baseUrl.empty()) {
+        missing.push_back("openai.base_url");
+    }
+    if (cfg.apiKey.empty()) {
+        missing.push_back("openai.api_key");
+    }
+    if (cfg.vmodelName.empty()) {
+        missing.push_back("openai.vmodel_name");
+    }
 
     if (!missing.empty()) {
         std::cerr << "[ERROR] Missing config values in " << path << ":";
-        for (const auto& key : missing) std::cerr << ' ' << key;
+        for (const auto& key : missing) {
+            std::cerr << ' ' << key;
+        }
         std::cerr << "\n";
         return false;
     }
@@ -110,6 +257,13 @@ static bool loadOpenAIConfig(const std::string& path, OpenAIConfig& cfg)
     return true;
 }
 
+//------------------------------------------------------------------------------
+// Encoding and API response parsing
+//------------------------------------------------------------------------------
+
+// Base64-encode a binary buffer.
+//
+// Used to embed a JPEG frame as a data URL in the API request body.
 static std::string base64Encode(const std::vector<uchar>& data)
 {
     static const char table[] =
@@ -123,6 +277,7 @@ static std::string base64Encode(const std::vector<uchar>& data)
             (static_cast<uint32_t>(data[i]) << 16) |
             (static_cast<uint32_t>(data[i + 1]) << 8) |
             static_cast<uint32_t>(data[i + 2]);
+
         encoded.push_back(table[(triple >> 18) & 0x3F]);
         encoded.push_back(table[(triple >> 12) & 0x3F]);
         encoded.push_back(table[(triple >> 6) & 0x3F]);
@@ -150,75 +305,164 @@ static std::string base64Encode(const std::vector<uchar>& data)
     return encoded;
 }
 
+// Extract human-readable text from an API response.
+//
+// We support a few plausible shapes because deployments using "OpenAI-like"
+// compatibility layers may not always return identical JSON structures.
 static std::string extractMessageText(const json& response)
 {
     const auto choicesIt = response.find("choices");
-    if (choicesIt == response.end() || !choicesIt->is_array() || choicesIt->empty()) {
-        return {};
-    }
+    if (choicesIt != response.end() && choicesIt->is_array() && !choicesIt->empty()) {
+        const auto& first = (*choicesIt)[0];
 
-    const auto& first = (*choicesIt)[0];
-    const auto messageIt = first.find("message");
-    if (messageIt == first.end()) return {};
-
-    const auto contentIt = messageIt->find("content");
-    if (contentIt == messageIt->end()) return {};
-
-    if (contentIt->is_string()) {
-        return contentIt->get<std::string>();
-    }
-
-    if (contentIt->is_array()) {
-        std::string combined;
-        for (const auto& part : *contentIt) {
-            const auto textIt = part.find("text");
-            if (textIt != part.end() && textIt->is_string()) {
-                combined += textIt->get<std::string>();
+        // Typical chat-completions shape:
+        // choices[0].message.content
+        const auto messageIt = first.find("message");
+        if (messageIt != first.end()) {
+            const auto contentIt = messageIt->find("content");
+            if (contentIt != messageIt->end()) {
+                if (contentIt->is_string()) {
+                    return contentIt->get<std::string>();
+                }
+                if (contentIt->is_array()) {
+                    std::string combined;
+                    for (const auto& part : *contentIt) {
+                        const auto textIt = part.find("text");
+                        if (textIt != part.end() && textIt->is_string()) {
+                            combined += textIt->get<std::string>();
+                        }
+                    }
+                    if (!combined.empty()) {
+                        return combined;
+                    }
+                }
             }
         }
-        return combined;
+
+        // Fallback shape sometimes seen in wrappers.
+        const auto textIt = first.find("text");
+        if (textIt != first.end() && textIt->is_string()) {
+            return textIt->get<std::string>();
+        }
+    }
+
+    // Additional defensive fallbacks.
+    const auto outputTextIt = response.find("output_text");
+    if (outputTextIt != response.end() && outputTextIt->is_string()) {
+        return outputTextIt->get<std::string>();
+    }
+
+    const auto outputIt = response.find("output");
+    if (outputIt != response.end() && outputIt->is_array()) {
+        std::string combined;
+        for (const auto& item : *outputIt) {
+            const auto contentIt = item.find("content");
+            if (contentIt == item.end() || !contentIt->is_array()) {
+                continue;
+            }
+            for (const auto& part : *contentIt) {
+                const auto textIt = part.find("text");
+                if (textIt != part.end() && textIt->is_string()) {
+                    combined += textIt->get<std::string>();
+                }
+            }
+        }
+        if (!combined.empty()) {
+            return combined;
+        }
     }
 
     return {};
 }
 
+//------------------------------------------------------------------------------
+// Time helpers
+//------------------------------------------------------------------------------
+
+// Thread-safe localtime wrapper.
+//
+// std::localtime() is not thread-safe, so we use platform-specific safe forms.
+static bool safeLocalTime(std::time_t t, std::tm& out)
+{
+#ifdef _WIN32
+    return localtime_s(&out, &t) == 0;
+#else
+    return localtime_r(&t, &out) != nullptr;
+#endif
+}
+
+// Format a system_clock time point as "[YYYY-mm-dd HH:MM:SS]".
 static std::string formatDateTime(const std::chrono::system_clock::time_point& tp)
 {
-    std::time_t t = std::chrono::system_clock::to_time_t(tp);
-    std::tm tm = *std::localtime(&t);
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+    if (!safeLocalTime(t, tm)) {
+        return "[invalid-local-time]";
+    }
+
     std::ostringstream oss;
     oss << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << ']';
     return oss.str();
 }
 
+// Parse a local datetime string of the form "YYYY-mm-dd HH:MM:SS".
 static bool parseDateTime(const std::string& s, std::chrono::system_clock::time_point& out)
 {
     std::tm tm{};
     std::istringstream iss(s);
     iss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-    if (iss.fail()) return false;
-    std::time_t tt = std::mktime(&tm);
-    if (tt == -1) return false;
+    if (iss.fail()) {
+        return false;
+    }
+
+    const std::time_t tt = std::mktime(&tm);
+    if (tt == static_cast<std::time_t>(-1)) {
+        return false;
+    }
+
     out = std::chrono::system_clock::from_time_t(tt);
     return true;
 }
 
-static std::chrono::system_clock::time_point fileTimeToSystemClock(const std::filesystem::file_time_type& ftime)
+// Convert filesystem clock values to system_clock values.
+//
+// This is useful when using the media file's last write time as a fallback
+// "encoded start" timestamp.
+static std::chrono::system_clock::time_point
+fileTimeToSystemClock(const std::filesystem::file_time_type& ftime)
 {
     using namespace std::chrono;
-    // Use the standard conversion to avoid clock skew errors.
-    return time_point_cast<system_clock::duration>(file_clock::to_sys(ftime));
+    return time_point_cast<system_clock::duration>(
+        std::filesystem::file_time_type::clock::to_sys(ftime));
 }
 
+// Add fractional seconds to a time point.
+static std::chrono::system_clock::time_point addSecondsToTimePoint(
+    const std::chrono::system_clock::time_point& base,
+    double sec)
+{
+    return base + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                      std::chrono::duration<double>(sec));
+}
+
+//------------------------------------------------------------------------------
+// Frame/image helpers
+//------------------------------------------------------------------------------
+
+// Resize a frame so that max(width, height) <= maxDim, preserving aspect ratio.
+// If maxDim <= 0, resizing is disabled.
 static cv::Mat resizeMaxDim(const cv::Mat& frame, int maxDim)
 {
-    if (maxDim <= 0) return frame;
-    if (frame.empty()) return frame;
+    if (maxDim <= 0 || frame.empty()) {
+        return frame;
+    }
 
     const int w = frame.cols;
     const int h = frame.rows;
     const int m = (w > h) ? w : h;
-    if (m <= maxDim) return frame;
+    if (m <= maxDim) {
+        return frame;
+    }
 
     const double scale = static_cast<double>(maxDim) / static_cast<double>(m);
     const int nw = std::max(1, static_cast<int>(std::lround(w * scale)));
@@ -229,15 +473,93 @@ static cv::Mat resizeMaxDim(const cv::Mat& frame, int maxDim)
     return resized;
 }
 
+//------------------------------------------------------------------------------
+// Strict numeric parsing helpers
+//------------------------------------------------------------------------------
+
+// Parse a double and require that the whole string is consumed.
+static bool parseDoubleStrict(const std::string& s, double& out)
+{
+    try {
+        size_t idx = 0;
+        out = std::stod(s, &idx);
+        return idx == s.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+// Parse an int and require that the whole string is consumed.
+static bool parseIntStrict(const std::string& s, int& out)
+{
+    try {
+        size_t idx = 0;
+        out = std::stoi(s, &idx);
+        return idx == s.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+// Return true if the entire string is composed of decimal digits.
+static bool isUnsignedIntegerString(const std::string& s)
+{
+    if (s.empty()) {
+        return false;
+    }
+    for (unsigned char ch : s) {
+        if (!std::isdigit(ch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Treat any non-empty unsigned integer as a camera index.
+//
+// This is more useful than the original single-digit check because device
+// indexes such as "10" should still work.
+static bool isCameraIndexSource(const std::string& s)
+{
+    return isUnsignedIntegerString(s);
+}
+
+// Open either a camera index or a URI/file path.
+static bool openCapture(cv::VideoCapture& cap, const std::string& src)
+{
+    if (isCameraIndexSource(src)) {
+        try {
+            const int index = std::stoi(src);
+            return cap.open(index);
+        } catch (...) {
+            return false;
+        }
+    }
+    return cap.open(src);
+}
+
+//------------------------------------------------------------------------------
+// OpenAI request
+//------------------------------------------------------------------------------
+
+// Encode a frame as JPEG, wrap it into a data URL, and send it to the model.
+//
+// We include both:
+// - wall time: how long the program has been running
+// - media position: where the frame sits in the media timeline
+//
+// Keeping those separate matters for offline file playback, where media time
+// should not drift if inference becomes slower or faster.
 static bool sendFrameToOpenAI(
     const cv::Mat& frame,
     double wallTimeSec,
+    double mediaPosSec,
     int triggerIdx,
     const OpenAIConfig& cfg,
     const std::string& prompt,
     int maxDim,
-    int jpegQuality
-) {
+    int jpegQuality)
+{
     cv::Mat resized = resizeMaxDim(frame, maxDim);
 
     std::vector<uchar> buffer;
@@ -245,12 +567,21 @@ static bool sendFrameToOpenAI(
     if (jpegQuality > 0 && jpegQuality <= 100) {
         params = {cv::IMWRITE_JPEG_QUALITY, jpegQuality};
     }
+
     if (!cv::imencode(".jpg", resized, buffer, params)) {
-        std::cerr << "[ERROR] Interval #" << triggerIdx << " failed to encode frame to JPEG\n";
+        std::cerr << "[ERROR] Interval #" << triggerIdx
+                  << " failed to encode frame to JPEG\n";
         return false;
     }
 
     const std::string dataUrl = "data:image/jpeg;base64," + base64Encode(buffer);
+
+    std::ostringstream promptStream;
+    promptStream
+        << prompt
+        << " Wall time: " << std::fixed << std::setprecision(3) << wallTimeSec << "s;"
+        << " media position: " << std::fixed << std::setprecision(3) << mediaPosSec << "s;"
+        << " interval #" << triggerIdx;
 
     json body = {
         {"model", cfg.vmodelName},
@@ -258,7 +589,7 @@ static bool sendFrameToOpenAI(
             {
                 {"role", "user"},
                 {"content", json::array({
-                    {{"type", "text"}, {"text", prompt + " Wall time: " + std::to_string(wallTimeSec) + "s; interval #" + std::to_string(triggerIdx)}},
+                    {{"type", "text"}, {"text", promptStream.str()}},
                     {{"type", "image_url"}, {"image_url", {{"url", dataUrl}}}}
                 })}
             }
@@ -276,281 +607,399 @@ static bool sendFrameToOpenAI(
         }
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[ERROR] OpenAI request failed for interval #" << triggerIdx << ": " << e.what() << "\n";
-        // If you want deeper debugging, uncomment:
-        // std::cerr << "[DEBUG] Raw response json: " << chat.dump(2) << "\n";
+        std::cerr << "[ERROR] OpenAI request failed for interval #"
+                  << triggerIdx << ": " << e.what() << "\n";
         return false;
     }
 }
 
-static void printUsage(const char* argv0)
-{
-    std::cerr
-        << "Usage: " << argv0 << " <video_or_stream_uri> [config.ini] [options]\n"
-        << "Options (defaults match current hardcoded behavior):\n"
-        << "  --interval <sec>        Prompt repetition interval in seconds (default 10)\n"
-        << "  --max-dim <px>          Resize frames so max(width,height)<=px (default 1024)\n"
-        << "  --jpeg-quality <1-100>  JPEG quality (default 85)\n"
-        << "  --prompt <text>         Prompt prefix (default: \"Analyze this frame.\")\n"
-        << "  --no-gui                Disable OpenCV imshow/waitKey\n"
-        << "  --reconnect-sec <sec>   Reconnect window for live streams (default 5)\n"
-        << "  --encoded-start \"YYYY-mm-dd HH:MM:SS\"  Override encoded/base datetime for media files\n";
-}
+//------------------------------------------------------------------------------
+// CLI parsing
+//------------------------------------------------------------------------------
 
-static bool isSingleDigitIndex(const std::string& s)
-{
-    return s.size() == 1 && std::isdigit(static_cast<unsigned char>(s[0]));
-}
-
-static bool openCapture(cv::VideoCapture& cap, const std::string& src)
-{
-    if (isSingleDigitIndex(src)) {
-        return cap.open(std::stoi(src));
-    }
-    return cap.open(src);
-}
-
-int main(int argc, char** argv)
+// Parse command-line arguments into ProgramOptions.
+//
+// Design goals:
+// - preserve the original CLI shape
+// - validate values with clear error messages
+// - avoid uncaught exceptions from stod/stoi
+static bool parseCommandLine(int argc, char** argv, ProgramOptions& opt)
 {
     if (argc < 2) {
         printUsage(argv[0]);
-        return 1;
+        return false;
     }
 
-    std::string src = argv[1];
+    opt.src = argv[1];
 
-    std::string configPath = "config.ini";
+    // Optional positional config path:
+    //   program <src> config.ini --interval 10
     if (argc >= 3 && std::string(argv[2]).rfind("--", 0) != 0) {
-        configPath = argv[2];
+        opt.configPath = argv[2];
     }
 
-    // Defaults (keep old behavior as defaults where applicable)
-    double intervalSec = 10.0;
-    int maxDim = 1024;
-    int jpegQuality = 85;
-    std::string prompt = "Analyze this frame.";
-    bool guiEnabled = true;
-    int reconnectSec = 5;
-    bool hasEncodedStart = false;
-    std::chrono::system_clock::time_point encodedStart;
+    int argi = 2;
+    if (argc >= 3 && std::string(argv[2]).rfind("--", 0) != 0) {
+        argi = 3;
+    }
 
-    // Parse options (after src and optional config.ini)
-    int optStart = 2;
-    if (argc >= 3 && std::string(argv[2]).rfind("--", 0) != 0) optStart = 3;
+    auto needValue = [&](const char* name) -> std::optional<std::string> {
+        if (argi + 1 >= argc) {
+            std::cerr << "[ERROR] Missing value for " << name << "\n";
+            return std::nullopt;
+        }
+        return std::string(argv[++argi]);
+    };
 
-    for (int i = optStart; i < argc; ++i) {
-        std::string a = argv[i];
-        auto needVal = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) {
-                std::cerr << "[ERROR] Missing value for " << name << "\n";
-                return nullptr;
-            }
-            return argv[++i];
-        };
+    for (; argi < argc; ++argi) {
+        const std::string a = argv[argi];
 
         if (a == "--interval") {
-            const char* v = needVal("--interval");
-            if (!v) return 1;
-            intervalSec = std::max(0.1, std::stod(v));
+            auto v = needValue("--interval");
+            if (!v) return false;
+
+            double parsed = 0.0;
+            if (!parseDoubleStrict(*v, parsed) || !std::isfinite(parsed) || parsed <= 0.0) {
+                std::cerr << "[ERROR] --interval must be a positive number\n";
+                return false;
+            }
+            opt.intervalSec = std::max(0.1, parsed);
         } else if (a == "--max-dim") {
-            const char* v = needVal("--max-dim");
-            if (!v) return 1;
-            maxDim = std::max(0, std::stoi(v));
+            auto v = needValue("--max-dim");
+            if (!v) return false;
+
+            int parsed = 0;
+            if (!parseIntStrict(*v, parsed) || parsed < 0) {
+                std::cerr << "[ERROR] --max-dim must be an integer >= 0\n";
+                return false;
+            }
+            opt.maxDim = parsed;
         } else if (a == "--jpeg-quality") {
-            const char* v = needVal("--jpeg-quality");
-            if (!v) return 1;
-            jpegQuality = std::stoi(v);
-            if (jpegQuality < 1 || jpegQuality > 100) {
+            auto v = needValue("--jpeg-quality");
+            if (!v) return false;
+
+            int parsed = 0;
+            if (!parseIntStrict(*v, parsed) || parsed < 1 || parsed > 100) {
                 std::cerr << "[ERROR] --jpeg-quality must be 1..100\n";
-                return 1;
+                return false;
             }
+            opt.jpegQuality = parsed;
         } else if (a == "--encoded-start") {
-            const char* v = needVal("--encoded-start");
-            if (!v) return 1;
-            if (!parseDateTime(v, encodedStart)) {
+            auto v = needValue("--encoded-start");
+            if (!v) return false;
+
+            if (!parseDateTime(*v, opt.encodedStart)) {
                 std::cerr << "[ERROR] --encoded-start expects \"YYYY-mm-dd HH:MM:SS\"\n";
-                return 1;
+                return false;
             }
-            hasEncodedStart = true;
+            opt.hasEncodedStart = true;
         } else if (a == "--prompt") {
-            const char* v = needVal("--prompt");
-            if (!v) return 1;
-            prompt = v;
+            auto v = needValue("--prompt");
+            if (!v) return false;
+            opt.prompt = *v;
         } else if (a == "--no-gui") {
-            guiEnabled = false;
+            opt.guiEnabled = false;
         } else if (a == "--reconnect-sec") {
-            const char* v = needVal("--reconnect-sec");
-            if (!v) return 1;
-            reconnectSec = std::max(0, std::stoi(v));
+            auto v = needValue("--reconnect-sec");
+            if (!v) return false;
+
+            int parsed = 0;
+            if (!parseIntStrict(*v, parsed) || parsed < 0) {
+                std::cerr << "[ERROR] --reconnect-sec must be an integer >= 0\n";
+                return false;
+            }
+            opt.reconnectSec = parsed;
         } else if (a == "--help" || a == "-h") {
             printUsage(argv[0]);
-            return 0;
+            std::exit(0);
         } else {
             std::cerr << "[ERROR] Unknown option: " << a << "\n";
             printUsage(argv[0]);
-            return 1;
+            return false;
         }
     }
 
-    OpenAIConfig cfg;
-    if (!loadOpenAIConfig(configPath, cfg)) {
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Main
+//------------------------------------------------------------------------------
+
+int main(int argc, char** argv)
+{
+    ProgramOptions options;
+    if (!parseCommandLine(argc, argv, options)) {
         return 1;
     }
+
+    OpenAIConfig cfg;
+    if (!loadOpenAIConfig(options.configPath, cfg)) {
+        return 1;
+    }
+
+    // Log the effective non-secret configuration for easier troubleshooting.
+    std::cerr << "[INFO] OpenAI base URL: " << cfg.baseUrl << "\n";
+    std::cerr << "[INFO] Vision model: " << cfg.vmodelName << "\n";
+    std::cerr << "[INFO] Source: " << options.src << "\n";
 
     try {
         openai::start(cfg.apiKey, "", true, cfg.baseUrl);
     } catch (const std::exception& e) {
-        std::cerr << "[ERROR] Failed to initialize OpenAI client: " << e.what() << "\n";
+        std::cerr << "[ERROR] Failed to initialize OpenAI client: "
+                  << e.what() << "\n";
         return 1;
     }
 
     cv::VideoCapture cap;
-    if (!openCapture(cap, src) || !cap.isOpened()) {
-        std::cerr << "Error: could not open source\n";
+    if (!openCapture(cap, options.src) || !cap.isOpened()) {
+        std::cerr << "[ERROR] Could not open source\n";
         return 1;
     }
 
+    // Request a small internal buffer to reduce lag on live sources.
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
 
-    // Heuristic: if frame count is known and >0, it's likely a file.
-    // For files, end-of-stream is expected; for streams, try reconnect briefly.
+    // Heuristic:
+    // - if frame count is finite and > 0, and the source is not a camera index,
+    //   treat it as a media file
+    // - otherwise assume a live-ish source
     const double frameCount = cap.get(cv::CAP_PROP_FRAME_COUNT);
-    const bool likelyFile = std::isfinite(frameCount) && frameCount > 0.0 && !isSingleDigitIndex(src);
-    std::chrono::system_clock::time_point fileBaseTime = std::chrono::system_clock::now();
+    const bool likelyFile =
+        std::isfinite(frameCount) &&
+        frameCount > 0.0 &&
+        !isCameraIndexSource(options.src);
+
+    // Base timestamp used to map media position -> encoded datetime.
+    //
+    // Priority:
+    // 1. explicit --encoded-start
+    // 2. file last_write_time
+    // 3. now()
+    std::chrono::system_clock::time_point fileBaseTime =
+        std::chrono::system_clock::now();
+
     if (likelyFile) {
-        if (hasEncodedStart) {
-            fileBaseTime = encodedStart;
+        if (options.hasEncodedStart) {
+            fileBaseTime = options.encodedStart;
         } else {
             std::error_code ec;
-            auto ft = std::filesystem::last_write_time(src, ec);
+            auto ft = std::filesystem::last_write_time(options.src, ec);
             if (!ec) {
                 fileBaseTime = fileTimeToSystemClock(ft);
             }
         }
     }
 
+    // Shared latest frame state.
+    //
+    // The capture thread continuously updates this.
+    // The main loop periodically samples it and overwrites the single pending
+    // inference job.
     std::mutex frameMtx;
     cv::Mat latestFrame;
     double latestMediaPosSec = 0.0;
-    std::atomic<bool> running{true};
 
-    // Pending (single-slot) inference request: newest wins.
-    struct PendingJob {
-        cv::Mat frame;
-        double wallTimeSec = 0.0;
-        double mediaPosSec = 0.0;
-        int triggerIdx = 0;
-        bool has = false;
-    };
-
+    // Shared job state for the worker thread.
     std::mutex jobMtx;
     std::condition_variable jobCv;
     PendingJob pending;
 
-    // Inference worker thread (keeps UI responsive; drops older pending jobs)
-    std::thread worker([&]{
-        while (running.load()) {
+    std::atomic<bool> running{true};
+
+    //--------------------------------------------------------------------------
+    // Worker thread
+    //
+    // Responsibilities:
+    // - wait for a pending job
+    // - process only the newest job
+    // - send frame to the model
+    //
+    // Important:
+    // For file playback, encoded timestamps are derived from mediaPosSec,
+    // not wallTimeSec. This avoids drift when inference is slower than real
+    // time or when file playback timing varies.
+    //--------------------------------------------------------------------------
+    std::thread worker([&] {
+        while (true) {
             PendingJob job;
             {
                 std::unique_lock<std::mutex> lk(jobMtx);
-                jobCv.wait(lk, [&]{ return !running.load() || pending.has; });
-                if (!running.load()) break;
+                jobCv.wait(lk, [&] { return pending.stop || pending.has; });
 
-                // Move newest job out; clear pending slot
+                if (pending.stop) {
+                    break;
+                }
+
                 job.wallTimeSec = pending.wallTimeSec;
+                job.mediaPosSec = pending.mediaPosSec;
                 job.triggerIdx = pending.triggerIdx;
                 pending.frame.copyTo(job.frame);
+
+                // Clear the pending slot immediately so that newer work can be
+                // scheduled while inference is running.
                 pending.has = false;
             }
 
-            if (!job.frame.empty()) {
-                auto now = std::chrono::system_clock::now();
-                std::string timeTag;
-                if (likelyFile) {
-                    auto encodedTp = fileBaseTime + std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                        std::chrono::duration<double>(job.wallTimeSec));
-                    timeTag = formatDateTime(encodedTp);
-                } else {
-                    timeTag = formatDateTime(now);
-                }
-
-                std::cout << timeTag << "  ";
-
-                sendFrameToOpenAI(job.frame, job.wallTimeSec, job.triggerIdx, cfg, prompt, maxDim, jpegQuality);
+            if (job.frame.empty()) {
+                continue;
             }
+
+            const auto now = std::chrono::system_clock::now();
+            const std::string acquisitionTag = formatDateTime(now);
+
+            std::string mediaTag;
+            if (likelyFile) {
+                mediaTag = formatDateTime(
+                    addSecondsToTimePoint(fileBaseTime, job.mediaPosSec));
+            } else {
+                mediaTag = acquisitionTag;
+            }
+
+            std::cout << acquisitionTag
+                      << " media-time=" << std::fixed << std::setprecision(3)
+                      << job.mediaPosSec << "s"
+                      << " encoded-at=" << mediaTag
+                      << "  ";
+
+            sendFrameToOpenAI(
+                job.frame,
+                job.wallTimeSec,
+                job.mediaPosSec,
+                job.triggerIdx,
+                cfg,
+                options.prompt,
+                options.maxDim,
+                options.jpegQuality);
         }
     });
+    ThreadJoiner workerJoiner(worker);
 
-    // Capture thread: keep only the most recent frame; reconnect briefly for streams
-    std::thread captureThread([&]{
+    //--------------------------------------------------------------------------
+    // Capture thread
+    //
+    // Responsibilities:
+    // - continuously read frames from OpenCV
+    // - keep only the latest frame
+    // - for files, pace playback approximately in real time
+    // - for streams, attempt reconnects on transient failures
+    //
+    // Notes:
+    // - For media files, we prefer CAP_PROP_POS_MSEC as the media timeline.
+    // - If POS_MSEC is unavailable, we fall back to FPS-derived progression.
+    //--------------------------------------------------------------------------
+    std::thread captureThread([&] {
         cv::Mat f;
         auto lastOk = std::chrono::steady_clock::now();
+
         const double fps = cap.get(cv::CAP_PROP_FPS);
         const bool hasValidFps = std::isfinite(fps) && fps > 1e-6;
         const double frameDuration = hasValidFps ? (1.0 / fps) : 0.0;
+
         const auto playbackStart = std::chrono::steady_clock::now();
         double fallbackPosSec = 0.0;
+        int reconnectAttempt = 0;
 
         while (running.load()) {
             if (cap.read(f) && !f.empty()) {
+                reconnectAttempt = 0;
                 lastOk = std::chrono::steady_clock::now();
 
-                // For files, throttle reads to approximate real-time playback
+                double mediaPosSec = fallbackPosSec;
+
                 if (likelyFile) {
-                    double targetSec = 0.0;
                     const double posMsec = cap.get(cv::CAP_PROP_POS_MSEC);
+
                     if (std::isfinite(posMsec) && posMsec >= 1e-3) {
-                        fallbackPosSec = posMsec / 1000.0;
-                        targetSec = fallbackPosSec;
+                        mediaPosSec = posMsec / 1000.0;
+                        fallbackPosSec = mediaPosSec;
                     } else if (hasValidFps) {
                         fallbackPosSec += frameDuration;
-                        targetSec = fallbackPosSec;
+                        mediaPosSec = fallbackPosSec;
                     }
 
-                    if (targetSec > 0.0) {
-                        const auto targetTime = playbackStart + std::chrono::duration<double>(targetSec);
+                    // Throttle file reading to approximately real-time playback
+                    // based on media position, not on loop speed.
+                    if (mediaPosSec > 0.0) {
+                        const auto targetTime =
+                            playbackStart + std::chrono::duration<double>(mediaPosSec);
                         const auto now = std::chrono::steady_clock::now();
                         if (targetTime > now) {
                             std::this_thread::sleep_for(targetTime - now);
                         }
+                    }
+                } else {
+                    // For streams/cameras, media position is less meaningful.
+                    // Use POS_MSEC only if the backend provides something sane.
+                    const double posMsec = cap.get(cv::CAP_PROP_POS_MSEC);
+                    if (std::isfinite(posMsec) && posMsec >= 0.0) {
+                        mediaPosSec = posMsec / 1000.0;
+                    } else {
+                        mediaPosSec = 0.0;
                     }
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(frameMtx);
                     f.copyTo(latestFrame);
-                    latestMediaPosSec = fallbackPosSec;
+                    latestMediaPosSec = mediaPosSec;
                 }
                 continue;
             }
 
+            // For files, EOF/failure is expected termination.
             if (likelyFile) {
                 running.store(false);
                 break;
             }
 
-            // Stream/camera: transient failure - try reconnect for reconnectSec seconds
+            // For streams/cameras, treat failures as transient up to a limit.
             const auto now = std::chrono::steady_clock::now();
-            const double downFor = std::chrono::duration<double>(now - lastOk).count();
+            const double downFor =
+                std::chrono::duration<double>(now - lastOk).count();
 
-            if (reconnectSec <= 0 || downFor > static_cast<double>(reconnectSec)) {
-                std::cerr << "[ERROR] Stream read failed for >" << reconnectSec
-                          << "s; stopping.\n";
+            if (options.reconnectSec <= 0 ||
+                downFor > static_cast<double>(options.reconnectSec)) {
+                std::cerr << "[ERROR] Stream read failed for >"
+                          << options.reconnectSec << "s; stopping.\n";
                 running.store(false);
                 break;
             }
 
-            std::cerr << "[WARN] Stream read failed; attempting reconnect...\n";
+            // Bounded exponential backoff:
+            // 250, 500, 1000, 2000, 2000, ...
+            ++reconnectAttempt;
+            const int backoffMs =
+                std::min(2000, 250 * (1 << std::min(reconnectAttempt - 1, 3)));
+
+            std::cerr << "[WARN] Stream read failed; attempting reconnect in "
+                      << backoffMs << " ms...\n";
+
             cap.release();
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            if (!openCapture(cap, src) || !cap.isOpened()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+
+            if (!running.load()) {
+                break;
+            }
+
+            if (!openCapture(cap, options.src) || !cap.isOpened()) {
                 continue;
             }
+
             cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+            lastOk = std::chrono::steady_clock::now();
         }
     });
+    ThreadJoiner captureJoiner(captureThread);
 
+    //--------------------------------------------------------------------------
+    // Main scheduling loop
+    //
+    // Responsibilities:
+    // - periodically sample the newest available frame
+    // - overwrite the pending single-slot inference job
+    // - optionally display the current frame in a GUI window
+    //--------------------------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
     double nextTrigger = 0.0;
     int triggerIdx = 0;
@@ -559,20 +1008,26 @@ int main(int argc, char** argv)
         const auto tNow = std::chrono::steady_clock::now();
         const double wallSec = std::chrono::duration<double>(tNow - t0).count();
 
-        // Repeat prompt every intervalSec; queue newest only
+        // Fire at fixed intervals.
+        //
+        // We overwrite the pending job rather than queueing indefinitely,
+        // because freshness matters more than completeness for this workload.
         if (wallSec >= nextTrigger) {
             cv::Mat frameCopy;
             double mediaPosSec = 0.0;
+
             {
                 std::lock_guard<std::mutex> lock(frameMtx);
-                if (!latestFrame.empty()) latestFrame.copyTo(frameCopy);
+                if (!latestFrame.empty()) {
+                    latestFrame.copyTo(frameCopy);
+                }
                 mediaPosSec = latestMediaPosSec;
             }
 
             if (!frameCopy.empty()) {
                 {
                     std::lock_guard<std::mutex> lk(jobMtx);
-                    pending.frame = frameCopy;          // overwrite slot
+                    pending.frame = frameCopy;
                     pending.wallTimeSec = wallSec;
                     pending.mediaPosSec = mediaPosSec;
                     pending.triggerIdx = triggerIdx++;
@@ -580,38 +1035,57 @@ int main(int argc, char** argv)
                 }
                 jobCv.notify_one();
 
-                while (wallSec >= nextTrigger) nextTrigger += intervalSec;
+                // If the main loop was delayed, catch up by advancing the next
+                // trigger beyond the current wall time.
+                while (wallSec >= nextTrigger) {
+                    nextTrigger += options.intervalSec;
+                }
             }
         }
 
-        // Optional display (non-blocking)
-        if (guiEnabled) {
+        // Optional local preview window.
+        //
+        // This is deliberately non-blocking: waitKey(1) allows GUI events to be
+        // processed without stalling capture/inference scheduling.
+        if (options.guiEnabled) {
             cv::Mat toShow;
             {
                 std::lock_guard<std::mutex> lock(frameMtx);
-                if (!latestFrame.empty()) latestFrame.copyTo(toShow);
+                if (!latestFrame.empty()) {
+                    latestFrame.copyTo(toShow);
+                }
             }
+
             if (!toShow.empty()) {
                 cv::imshow("Live", toShow);
-                int key = cv::waitKey(1);
-                if (key == 'q' || key == 27) running.store(false);
+                const int key = cv::waitKey(1);
+                if (key == 'q' || key == 27) {
+                    running.store(false);
+                }
             }
         }
 
+        // Small sleep to avoid a busy-spin main loop.
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    //--------------------------------------------------------------------------
     // Shutdown
+    //
+    // Signal the worker explicitly instead of faking a pending job.
+    //--------------------------------------------------------------------------
     {
         std::lock_guard<std::mutex> lk(jobMtx);
-        pending.has = true; // wake worker
+        pending.stop = true;
+        pending.has = false;
     }
     jobCv.notify_one();
 
-    if (captureThread.joinable()) captureThread.join();
-    if (worker.joinable()) worker.join();
-
     cap.release();
-    if (guiEnabled) cv::destroyAllWindows();
+
+    if (options.guiEnabled) {
+        cv::destroyAllWindows();
+    }
+
     return 0;
 }
