@@ -425,6 +425,7 @@ static bool parseDateTime(const std::string& s, std::chrono::system_clock::time_
     return true;
 }
 
+// Normalize metadata datetime variants (T/Z/fractional/tz suffixes) then parse.
 static bool parseMetadataDateTime(
     std::string value,
     std::chrono::system_clock::time_point& out)
@@ -459,6 +460,7 @@ static bool parseMetadataDateTime(
     return parseDateTime(value, out);
 }
 
+// Probe ffprobe start_time_realtime (microseconds since epoch) for media files.
 static std::optional<std::chrono::system_clock::time_point>
 probeFileEncodedTimelineStart(const std::string& path)
 {
@@ -511,6 +513,7 @@ probeFileEncodedTimelineStart(const std::string& path)
     return std::nullopt;
 }
 
+// Probe ffprobe creation_time tags and parse to local system_clock time.
 static std::optional<std::chrono::system_clock::time_point>
 probeFileEncodedStartTime(const std::string& path)
 {
@@ -847,6 +850,7 @@ static bool parseCommandLine(int argc, char** argv, ProgramOptions& opt)
 // Main
 //------------------------------------------------------------------------------
 
+// Entry point wiring capture, scheduling, and inference worker threads.
 int main(int argc, char** argv)
 {
     ProgramOptions options;
@@ -989,6 +993,8 @@ int main(int argc, char** argv)
                                                   ? mediaTag
                                                   : acquisitionTag;
 
+            // For files we log encoded media timeline time; for live sources we
+            // fall back to acquisition time because no stable encoded timeline exists.
             std::cout << logTimestamp
                       << " media-time=" << std::fixed << std::setprecision(3)
                       << job.mediaPosSec << "s";
