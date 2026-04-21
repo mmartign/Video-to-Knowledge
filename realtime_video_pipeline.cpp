@@ -14,6 +14,7 @@
 #include <openai.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -21,8 +22,8 @@
 #include <cctype>
 #include <cstdint>
 #include <ctime>
+#include <cstdio>
 #include <exception>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -60,9 +61,9 @@ struct ProgramOptions {
     int reconnectSec = 5;
 
     // Optional explicit base datetime for media files.
-    // If absent, we fall back to the file modification time when possible.
-    bool hasEncodedStart = false;
-    std::chrono::system_clock::time_point encodedStart{};
+    // If absent, we try media metadata creation_time, then application start.
+    bool hasPredefinedStartTime = false;
+    std::chrono::system_clock::time_point predefinedStartTime{};
 };
 
 // Single-slot job exchanged between the main thread and the inference worker.
@@ -114,8 +115,8 @@ static void printUsage(const char* argv0)
         << "  --prompt <text>         Prompt prefix (default: \"Analyze this frame.\")\n"
         << "  --no-gui                Disable OpenCV imshow/waitKey\n"
         << "  --reconnect-sec <sec>   Reconnect window for live streams (default 5)\n"
-        << "  --encoded-start \"YYYY-mm-dd HH:MM:SS\"\n"
-        << "                          Override encoded/base datetime for media files\n";
+        << "  --predefined_start_time \"YYYY-mm-dd HH:MM:SS\"\n"
+        << "                          Override base datetime for media files\n";
 }
 
 // Trim leading and trailing whitespace in place.
@@ -424,16 +425,136 @@ static bool parseDateTime(const std::string& s, std::chrono::system_clock::time_
     return true;
 }
 
-// Convert filesystem clock values to system_clock values.
-//
-// This is useful when using the media file's last write time as a fallback
-// "encoded start" timestamp.
-static std::chrono::system_clock::time_point
-fileTimeToSystemClock(const std::filesystem::file_time_type& ftime)
+static bool parseMetadataDateTime(
+    std::string value,
+    std::chrono::system_clock::time_point& out)
 {
-    using namespace std::chrono;
-    return time_point_cast<system_clock::duration>(
-        std::filesystem::file_time_type::clock::to_sys(ftime));
+    if (!trimInPlace(value)) {
+        return false;
+    }
+
+    std::replace(value.begin(), value.end(), 'T', ' ');
+    if (!value.empty() && (value.back() == 'Z' || value.back() == 'z')) {
+        value.pop_back();
+    }
+
+    const size_t fracPos = value.find('.');
+    if (fracPos != std::string::npos) {
+        value.erase(fracPos);
+    }
+
+    const size_t tzPos = value.find_first_of("+-", 19);
+    if (tzPos != std::string::npos) {
+        value.erase(tzPos);
+    }
+
+    if (!trimInPlace(value)) {
+        return false;
+    }
+    if (value.size() < 19) {
+        return false;
+    }
+
+    value = value.substr(0, 19);
+    return parseDateTime(value, out);
+}
+
+static std::optional<std::chrono::system_clock::time_point>
+probeFileEncodedTimelineStart(const std::string& path)
+{
+#ifdef _WIN32
+    const std::string cmd =
+        "ffprobe -v error -show_entries format=start_time_realtime:stream=start_time_realtime "
+        "-of default=noprint_wrappers=1:nokey=1 \"" + path + "\" 2>nul";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+    const std::string cmd =
+        "ffprobe -v error -show_entries format=start_time_realtime:stream=start_time_realtime "
+        "-of default=noprint_wrappers=1:nokey=1 \"" + path + "\" 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        return std::nullopt;
+    }
+
+    std::string output;
+    char buffer[256];
+    while (std::fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    const int rc = _pclose(pipe);
+#else
+    const int rc = pclose(pipe);
+#endif
+    if (rc != 0 || output.empty()) {
+        return std::nullopt;
+    }
+
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!trimInPlace(line)) {
+            continue;
+        }
+        try {
+            const long long micros = std::stoll(line);
+            if (micros <= 0) {
+                continue;
+            }
+            return std::chrono::system_clock::time_point{
+                std::chrono::microseconds(micros)};
+        } catch (...) {
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<std::chrono::system_clock::time_point>
+probeFileEncodedStartTime(const std::string& path)
+{
+#ifdef _WIN32
+    const std::string cmd =
+        "ffprobe -v error -show_entries "
+        "format_tags=creation_time:stream_tags=creation_time "
+        "-of default=noprint_wrappers=1:nokey=1 \"" + path + "\" 2>nul";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+    const std::string cmd =
+        "ffprobe -v error -show_entries "
+        "format_tags=creation_time:stream_tags=creation_time "
+        "-of default=noprint_wrappers=1:nokey=1 \"" + path + "\" 2>/dev/null";
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        return std::nullopt;
+    }
+
+    std::string output;
+    char buffer[256];
+    while (std::fgets(buffer, static_cast<int>(sizeof(buffer)), pipe) != nullptr) {
+        output += buffer;
+    }
+
+#ifdef _WIN32
+    const int rc = _pclose(pipe);
+#else
+    const int rc = pclose(pipe);
+#endif
+    if (rc != 0 || output.empty()) {
+        return std::nullopt;
+    }
+
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::chrono::system_clock::time_point parsed{};
+        if (parseMetadataDateTime(line, parsed)) {
+            return parsed;
+        }
+    }
+    return std::nullopt;
 }
 
 // Add fractional seconds to a time point.
@@ -684,15 +805,15 @@ static bool parseCommandLine(int argc, char** argv, ProgramOptions& opt)
                 return false;
             }
             opt.jpegQuality = parsed;
-        } else if (a == "--encoded-start") {
-            auto v = needValue("--encoded-start");
+        } else if (a == "--predefined_start_time") {
+            auto v = needValue("--predefined_start_time");
             if (!v) return false;
 
-            if (!parseDateTime(*v, opt.encodedStart)) {
-                std::cerr << "[ERROR] --encoded-start expects \"YYYY-mm-dd HH:MM:SS\"\n";
+            if (!parseDateTime(*v, opt.predefinedStartTime)) {
+                std::cerr << "[ERROR] --predefined_start_time expects \"YYYY-mm-dd HH:MM:SS\"\n";
                 return false;
             }
-            opt.hasEncodedStart = true;
+            opt.hasPredefinedStartTime = true;
         } else if (a == "--prompt") {
             auto v = needValue("--prompt");
             if (!v) return false;
@@ -770,23 +891,30 @@ int main(int argc, char** argv)
         frameCount > 0.0 &&
         !isCameraIndexSource(options.src);
 
-    // Base timestamp used to map media position -> encoded datetime.
+    const auto applicationStartTime = std::chrono::system_clock::now();
+
+    // Base timestamp used to map media position -> absolute datetime.
     //
     // Priority:
-    // 1. explicit --encoded-start
-    // 2. file last_write_time
-    // 3. now()
+    // 1. explicit --predefined_start_time
+    // 2. encoded timeline start (start_time_realtime)
+    // 3. encoded start from media metadata (creation_time)
+    // 4. application start time
     std::chrono::system_clock::time_point fileBaseTime =
-        std::chrono::system_clock::now();
+        applicationStartTime;
 
     if (likelyFile) {
-        if (options.hasEncodedStart) {
-            fileBaseTime = options.encodedStart;
+        if (options.hasPredefinedStartTime) {
+            fileBaseTime = options.predefinedStartTime;
         } else {
-            std::error_code ec;
-            auto ft = std::filesystem::last_write_time(options.src, ec);
-            if (!ec) {
-                fileBaseTime = fileTimeToSystemClock(ft);
+            const auto timeline = probeFileEncodedTimelineStart(options.src);
+            if (timeline.has_value()) {
+                fileBaseTime = *timeline;
+            } else {
+                const auto probed = probeFileEncodedStartTime(options.src);
+                if (probed.has_value()) {
+                    fileBaseTime = *probed;
+                }
             }
         }
     }
@@ -845,8 +973,8 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            const auto now = std::chrono::system_clock::now();
-            const std::string acquisitionTag = formatDateTime(now);
+            const std::string acquisitionTag = formatDateTime(
+                addSecondsToTimePoint(applicationStartTime, job.wallTimeSec));
 
             std::string mediaTag;
             if (likelyFile) {
@@ -856,11 +984,18 @@ int main(int argc, char** argv)
                 mediaTag = acquisitionTag;
             }
 
-            std::cout << acquisitionTag
+            const bool useEncodedTimelineTag = likelyFile;
+            const std::string& logTimestamp = useEncodedTimelineTag
+                                                  ? mediaTag
+                                                  : acquisitionTag;
+
+            std::cout << logTimestamp
                       << " media-time=" << std::fixed << std::setprecision(3)
-                      << job.mediaPosSec << "s"
-                      << " encoded-at=" << mediaTag
-                      << "  ";
+                      << job.mediaPosSec << "s";
+            if (!useEncodedTimelineTag) {
+                std::cout << " encoded-at=" << mediaTag;
+            }
+            std::cout << "  ";
 
             sendFrameToOpenAI(
                 job.frame,
