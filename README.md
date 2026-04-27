@@ -13,20 +13,23 @@ The system has been **explicitly designed for healthcare applications**, where p
 
 ## What SI-Watcher does
 
-- **Ingests video** from live cameras, network streams, or recorded files  
-- **Samples frames** at configurable, time-based intervals (trigger-style sampling)  
-- Performs **context-aware vision analysis** using multimodal GenAI (images + prompts)  
-- Generates **structured outputs** in (near) real time directly on edge hardware  
+- **Ingests video** from live cameras (by device index), network streams (RTSP/HTTP), or recorded media files  
+- **Samples frames** at configurable, fixed-interval triggers  
+- Encodes sampled frames as JPEG data URLs and forwards them to a **multimodal GenAI model** with a configurable text prompt  
+- Logs **timestamped model responses** to stdout in (near) real time, directly on edge hardware  
 
 ---
 
 ## Core capabilities
 
-- Live video ingestion (RTSP/HTTP streams, USB cameras, video files)  
-- Adaptive, time-based frame sampling  
-- Multimodal GenAI inference (vision + language)  
-- Edge-first architecture (single industrial or medical-grade PC)  
-- Fully open-source and highly configurable  
+- Live video ingestion (RTSP/HTTP streams, USB/camera device indices, video files)  
+- Fixed-interval frame sampling with automatic catch-up under load  
+- Single-slot job queue: newer frames silently overwrite stale pending inference work, keeping latency bounded  
+- Multimodal GenAI inference via any **OpenAI-compatible vision API**  
+- Optional real-time local preview window (OpenCV `imshow`)  
+- Edge-first architecture — runs on a single industrial or medical-grade PC  
+- Cross-platform: Linux and Windows supported  
+- Fully open-source and highly configurable via CLI and INI file  
 
 ---
 
@@ -37,7 +40,7 @@ SI-Watcher was architected with **healthcare environments** in mind, including:
 - **Patient privacy preservation** (no mandatory cloud dependency)  
 - **On-premise deployment** in hospitals, clinics, and laboratories  
 - **Low-latency decision support** for time-critical scenarios  
-- **Auditability and structured outputs** suitable for clinical workflows  
+- **Auditability**: each inference output is tagged with both wall-clock acquisition time and encoded media timeline time  
 
 The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility with medical multimodal models for observational analysis, contextual interpretation, and structured reporting.
 
@@ -47,11 +50,14 @@ The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility 
 
 ## Key innovations
 
-- Multimodal GenAI applied directly to sampled video frames  
-- Non-blocking, resilient pipeline with frame dropping under load  
-- Edge-optimized JPEG encoding with adaptive resizing  
-- Robust live-stream reconnection handling  
-- CLI-first, automation-friendly design  
+- Multimodal GenAI applied directly to sampled video frames via inline JPEG data URLs  
+- **Single-slot inference queue**: freshness is prioritised over completeness — slow inference never causes queue backlog  
+- Aspect-ratio-preserving resize using `max-dim` constraint before JPEG encoding  
+- Accurate **dual-timestamp logging**: wall time (program uptime) and media position (encoded timeline) are tracked independently, preventing drift during file playback  
+- **Smart base-time resolution** for recorded files: tries `--predefined_start_time`, then `ffprobe start_time_realtime`, then `ffprobe creation_time`, then application start — in that order  
+- Bounded-exponential backoff reconnection for live streams (250 ms → 500 ms → 1000 ms → 2000 ms, capped)  
+- Compatible with any **OpenAI-compatible** vision API response shape (standard `choices[0].message.content`, content arrays, and common wrapper variants)  
+- Non-blocking GUI: `waitKey(1)` allows `q`/`Esc` to quit without stalling the capture or inference pipeline  
 
 ---
 
@@ -64,22 +70,110 @@ The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility 
 
 ---
 
-## Technical highlights
+## Architecture
 
-- OpenCV-based video capture and rendering  
-- Multithreaded pipeline (capture, sampling, inference, UI/output)  
-- Adaptive JPEG compression and resizing  
-- OpenAI-compatible multimodal vision API integration  
-- Production-grade error handling and recovery  
+The pipeline runs four concurrent components on a single edge PC:
+
+```
+┌──────────────┐    latest frame     ┌──────────────────┐
+│ Capture      │ ─────────────────▶  │ Scheduling loop  │
+│ Thread       │   (mutex-protected) │ (main thread)    │
+│              │                     │                  │
+│ OpenCV read  │                     │ Fires at fixed   │
+│ Reconnect    │                     │ intervals;       │
+│ backoff      │                     │ overwrites slot  │
+└──────────────┘                     └────────┬─────────┘
+                                              │ single-slot job
+                                              ▼
+                                     ┌──────────────────┐
+                                     │ Worker Thread    │
+                                     │                  │
+                                     │ Resize → JPEG    │
+                                     │ → base64 → API   │
+                                     │ → stdout log     │
+                                     └──────────────────┘
+```
+
+1. **Capture thread** — reads frames from OpenCV continuously; stores only the latest frame in a mutex-protected slot; handles reconnection for live streams with exponential backoff  
+2. **Scheduling loop (main thread)** — fires at fixed `--interval` cadence; copies the latest frame into the single pending inference job; also drives the optional GUI preview  
+3. **Worker thread** — waits for a pending job, encodes the frame as JPEG, base64-encodes it into a data URL, sends it to the model via the OpenAI-compatible API, and prints the response to stdout  
+4. **GUI (optional)** — non-blocking `imshow`/`waitKey(1)` preview; disabled with `--no-gui`  
+
+---
+
+## Configuration
+
+### INI file (required)
+
+The API connection is loaded from an INI file (default: `config.ini`).
+
+```ini
+[openai]
+base_url    = http://localhost:11434/v1/   ; or any OpenAI-compatible endpoint
+api_key     = your-api-key-here
+vmodel_name = medgemma-15:4b              ; any vision-capable model name
+```
+
+All three keys are required. The application will print a clear error and exit if any are missing.
+
+### Command-line options
+
+```
+Usage: <program> <video_or_stream_uri> [config.ini] [options]
+
+Positional arguments:
+  <video_or_stream_uri>          RTSP/HTTP stream URL, camera device index (e.g. 0), or video file path
+  [config.ini]                   Path to INI config file (default: config.ini)
+
+Options:
+  --interval <sec>               Frame sampling interval in seconds (default: 10; minimum: 0.1)
+  --max-dim <px>                 Resize frames so max(width, height) ≤ px before encoding (default: 1024; 0 = disabled)
+  --jpeg-quality <1-100>         JPEG encoding quality (default: 85)
+  --prompt <text>                Text prompt sent to the model with each frame (default: "Analyze this frame.")
+  --no-gui                       Disable the OpenCV imshow preview window
+  --reconnect-sec <sec>          Seconds to attempt reconnection before giving up on a live stream (default: 5; 0 = no retry)
+  --predefined_start_time "YYYY-mm-dd HH:MM:SS"
+                                 Override the base datetime for media file timestamp calculations
+  --help / -h                    Print usage and exit
+```
+
+---
+
+## Output format
+
+Each inference result is printed to **stdout** with timing context:
+
+```
+[2026-04-27 10:15:30] media-time=30.000s  <model response text>
+```
+
+For live streams, the log line uses acquisition time and also includes `encoded-at=<timestamp>`. For file playback, the primary timestamp is derived from the encoded media timeline, anchored to the resolved base time.
+
+Wall time and media position are also appended to the prompt sent to the model:
+
+```
+Analyze this frame. Wall time: 30.000s; media position: 30.000s; interval #3
+```
+
+---
+
+## Dependencies
+
+| Library | Purpose |
+|---|---|
+| [OpenCV](https://opencv.org/) | Video capture, frame decoding, JPEG encoding, GUI preview |
+| [openai-cpp](https://github.com/olrea/openai-cpp) | OpenAI-compatible API client (`openai::chat().create(...)`) |
+| [nlohmann/json](https://github.com/nlohmann/json) | JSON serialisation of API request/response |
+| ffprobe (optional, runtime) | Probing encoded `start_time_realtime` and `creation_time` from media files |
 
 ---
 
 ## Example use case (healthcare monitoring)
 
 1. A camera observes a clinical or laboratory environment  
-2. SI-Watcher samples a frame every **N seconds**  
-3. A multimodal GenAI model (e.g. **MedGemma-15:4b**) interprets visual context  
-4. Structured insights are generated (events, summaries, confidence scores)  
+2. SI-Watcher samples a frame every **N seconds** (configurable via `--interval`)  
+3. The frame is JPEG-encoded, base64-embedded, and sent to a multimodal model (e.g. **MedGemma-1.5:4b**) with a structured prompt  
+4. The model's response is printed to stdout with a wall-clock and media-position timestamp  
 5. Clinicians or operators remain in the loop for validation and action  
 
 ---
@@ -95,25 +189,13 @@ The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility 
 
 ---
 
-## Architecture (high level)
+## Source heuristics
 
-A typical deployment runs on a single edge or industrial PC:
+The application automatically distinguishes between **live streams/cameras** and **media files**:
 
-1. **Capture** → OpenCV video ingestion with reconnection handling  
-2. **Sampler** → time-based triggers with optional frame dropping  
-3. **Preprocessing** → resize and JPEG encode for efficiency  
-4. **Inference** → multimodal GenAI (OpenAI-compatible API)  
-5. **Output** → structured events (log, file, or API sink)  
-
----
-
-## Configuration highlights
-
-- `--source` — RTSP/HTTP stream, device index, or video file  
-- `--interval` — frame sampling cadence (seconds)  
-- `--max-width / --max-height` or `--resize` — preprocessing constraints  
-- `--drop-frames` — maintain responsiveness under load  
-- `--vision-endpoint` + `--api-key` — OpenAI-compatible vision API  
+- A numeric-only source string (e.g. `0`, `1`, `10`) is treated as a **camera device index**  
+- Any other string is opened as a URI or file path  
+- If `CAP_PROP_FRAME_COUNT` is finite and positive, and the source is not a camera index, it is treated as a **media file** (enabling real-time playback pacing and encoded-timeline timestamping)  
 
 ---
 
@@ -133,14 +215,12 @@ Italy
 
 https://spazioit.com
 
-Part of the **OR-Edge Project** --- AI-powered solutions for medical
-edge environments.
+Part of the **OR-Edge Project** — AI-powered solutions for medical edge environments.
 
 ---
 
 ## ⚠ Disclaimer
 
 This software is provided **without warranty**.\
-It is intended for research, validation, and controlled medical IT
-environments.\
+It is intended for research, validation, and controlled medical IT environments.\
 It does not replace certified medical decision systems.
