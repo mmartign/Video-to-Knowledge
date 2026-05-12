@@ -392,6 +392,18 @@ static bool safeLocalTime(std::time_t t, std::tm& out)
 #endif
 }
 
+// Thread-safe gmtime wrapper used for explicit wall-clock timestamps. The
+// timestamp is stored on the Unix timeline only for duration arithmetic; gmtime
+// keeps the printed civil time independent from the host local timezone.
+static bool safeUtcTime(std::time_t t, std::tm& out)
+{
+#ifdef _WIN32
+    return gmtime_s(&out, &t) == 0;
+#else
+    return gmtime_r(&t, &out) != nullptr;
+#endif
+}
+
 // Format a system_clock time point as "[YYYY-mm-dd HH:MM:SS]".
 static std::string formatDateTime(const std::chrono::system_clock::time_point& tp)
 {
@@ -399,6 +411,22 @@ static std::string formatDateTime(const std::chrono::system_clock::time_point& t
     std::tm tm{};
     if (!safeLocalTime(t, tm)) {
         return "[invalid-local-time]";
+    }
+
+    std::ostringstream oss;
+    oss << '[' << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << ']';
+    return oss.str();
+}
+
+// Format timestamps derived from --predefined_start_time without applying local
+// timezone or DST conversion.
+static std::string formatDateTimeNoConversion(
+    const std::chrono::system_clock::time_point& tp)
+{
+    const std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm{};
+    if (!safeUtcTime(t, tm)) {
+        return "[invalid-time]";
     }
 
     std::ostringstream oss;
@@ -422,6 +450,128 @@ static bool parseDateTime(const std::string& s, std::chrono::system_clock::time_
     }
 
     out = std::chrono::system_clock::from_time_t(tt);
+    return true;
+}
+
+struct DateTimeParts {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+static bool parseNDigits(const std::string& s, size_t pos, size_t count, int& out)
+{
+    if (pos + count > s.size()) {
+        return false;
+    }
+
+    int value = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[pos + i]);
+        if (!std::isdigit(c)) {
+            return false;
+        }
+        value = value * 10 + static_cast<int>(c - '0');
+    }
+    out = value;
+    return true;
+}
+
+static bool isLeapYear(int year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+static int daysInMonth(int year, int month)
+{
+    static constexpr int kDaysByMonth[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && isLeapYear(year)) {
+        return 29;
+    }
+    if (month < 1 || month > 12) {
+        return 0;
+    }
+    return kDaysByMonth[month - 1];
+}
+
+static bool parseDateTimeParts(const std::string& s, DateTimeParts& out)
+{
+    if (s.size() != 19 ||
+        s[4] != '-' ||
+        s[7] != '-' ||
+        s[10] != ' ' ||
+        s[13] != ':' ||
+        s[16] != ':') {
+        return false;
+    }
+
+    DateTimeParts parsed{};
+    if (!parseNDigits(s, 0, 4, parsed.year) ||
+        !parseNDigits(s, 5, 2, parsed.month) ||
+        !parseNDigits(s, 8, 2, parsed.day) ||
+        !parseNDigits(s, 11, 2, parsed.hour) ||
+        !parseNDigits(s, 14, 2, parsed.minute) ||
+        !parseNDigits(s, 17, 2, parsed.second)) {
+        return false;
+    }
+
+    const int monthDays = daysInMonth(parsed.year, parsed.month);
+    if (parsed.year < 1 ||
+        monthDays == 0 ||
+        parsed.day < 1 ||
+        parsed.day > monthDays ||
+        parsed.hour > 23 ||
+        parsed.minute > 59 ||
+        parsed.second > 59) {
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+// Days since 1970-01-01 for a Gregorian civil date. This is intentionally
+// timezone-free and does not consult operating-system local timezone rules.
+static std::int64_t daysFromCivil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned doy =
+        (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return static_cast<std::int64_t>(era) * 146097 +
+           static_cast<std::int64_t>(doe) -
+           719468;
+}
+
+// Parse an explicit datetime without local timezone or DST conversion. The
+// resulting time_point must be formatted with formatDateTimeNoConversion().
+static bool parseDateTimeNoConversion(
+    const std::string& s,
+    std::chrono::system_clock::time_point& out)
+{
+    DateTimeParts parts{};
+    if (!parseDateTimeParts(s, parts)) {
+        return false;
+    }
+
+    const std::int64_t days = daysFromCivil(
+        parts.year,
+        static_cast<unsigned>(parts.month),
+        static_cast<unsigned>(parts.day));
+    const std::int64_t totalSeconds =
+        days * 86400 +
+        static_cast<std::int64_t>(parts.hour) * 3600 +
+        static_cast<std::int64_t>(parts.minute) * 60 +
+        static_cast<std::int64_t>(parts.second);
+
+    out = std::chrono::system_clock::time_point{
+        std::chrono::seconds(totalSeconds)};
     return true;
 }
 
@@ -812,7 +962,7 @@ static bool parseCommandLine(int argc, char** argv, ProgramOptions& opt)
             auto v = needValue("--predefined_start_time");
             if (!v) return false;
 
-            if (!parseDateTime(*v, opt.predefinedStartTime)) {
+            if (!parseDateTimeNoConversion(*v, opt.predefinedStartTime)) {
                 std::cerr << "[ERROR] --predefined_start_time expects \"YYYY-mm-dd HH:MM:SS\"\n";
                 return false;
             }
@@ -982,8 +1132,11 @@ int main(int argc, char** argv)
 
             std::string mediaTag;
             if (likelyFile) {
-                mediaTag = formatDateTime(
-                    addSecondsToTimePoint(fileBaseTime, job.mediaPosSec));
+                const auto mediaTime =
+                    addSecondsToTimePoint(fileBaseTime, job.mediaPosSec);
+                mediaTag = options.hasPredefinedStartTime
+                    ? formatDateTimeNoConversion(mediaTime)
+                    : formatDateTime(mediaTime);
             } else {
                 mediaTag = acquisitionTag;
             }
