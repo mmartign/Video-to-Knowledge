@@ -218,6 +218,26 @@ static std::string ensureTrailingSlash(const std::string& url)
     return url + "/";
 }
 
+static bool endsWith(const std::string& value, const std::string& suffix)
+{
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::string toLowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static bool usesOpenWebUIChatEndpoint(const std::string& baseUrl)
+{
+    const std::string normalized = ensureTrailingSlash(toLowerAscii(baseUrl));
+    return endsWith(normalized, "/api/") || endsWith(normalized, "/api/v1/");
+}
+
 // Load and validate the required OpenAI config values.
 static bool loadOpenAIConfig(const std::string& path, OpenAIConfig& cfg)
 {
@@ -870,6 +890,19 @@ static bool sendFrameToOpenAI(
         })},
         {"stream", false}
     };
+
+    if (usesOpenWebUIChatEndpoint(cfg.baseUrl)) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::string requestId =
+            "realtime-video-" + std::to_string(nowMs) + "-" + std::to_string(triggerIdx);
+
+        // Open WebUI's /api chat route assumes metadata.chat_id is a string
+        // during response post-processing. Supplying a local chat id avoids a
+        // server-side None.startswith() failure for direct API callers.
+        body["chat_id"] = "local:" + requestId;
+        body["id"] = "msg-" + requestId;
+    }
 
     try {
         auto chat = openai::chat().create(body);
