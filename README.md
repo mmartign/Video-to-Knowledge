@@ -2,6 +2,7 @@
 
 # SI-Watcher  
 ### Real-Time Video-to-Knowledge Engine for Edge AI
+### *"Video-to-Knowledge, not Video-to-Identity."*
 
 **SI-Watcher** is an edge-first, real-time **video-to-knowledge pipeline** designed to transform live or recorded video streams into **structured, actionable insights** using **multimodal Generative AI**—securely, locally, and with ultra-low latency.
 
@@ -45,6 +46,29 @@ SI-Watcher was architected with **healthcare environments** in mind, including:
 The pipeline has been **tested with MedGemma-1.5:4b**, confirming compatibility with medical multimodal models for observational analysis, contextual interpretation, and structured reporting.
 
 > While healthcare is a primary focus, the architecture remains domain-agnostic and adaptable to other safety-critical environments.
+
+---
+
+## Privacy-by-Design and No Biometric Identification
+
+> **"Understand the situation, not the identity."**  
+> **"Video-to-Knowledge, not Video-to-Identity."**
+
+SI-Watcher and the underlying Video-to-Knowledge technology are designed to extract contextual and operational knowledge from video streams **without performing facial recognition, biometric identification, or biometric categorization** of individuals. The system focuses on events, situations, objects, activities, safety conditions, and process observations — not on identifying people.
+
+This design choice supports a **privacy-by-design approach** and reduces regulatory risks associated with biometric processing under the **EU AI Act** and **GDPR**. By analyzing *what is happening* rather than *who a person is*, SI-Watcher enables organizations to obtain operational insights while minimizing the collection and processing of personal data.
+
+Key characteristics:
+
+- No facial recognition  
+- No biometric identification  
+- No biometric categorization  
+- No creation of biometric databases  
+- Focus on events, behaviors, safety, and operational conditions  
+- Edge-based processing to reduce data exposure  
+- Human oversight of AI-generated observations  
+
+As a result, SI-Watcher is positioned as a **Video-to-Knowledge platform** for situational awareness and operational intelligence — not as a surveillance or identity-tracking system.
 
 ---
 
@@ -184,7 +208,7 @@ Analyze this frame. Wall time: 30.000s; media position: 30.000s; interval #3
 - Medical device and procedure monitoring  
 - Laboratory and research environments  
 - Industrial monitoring and inspections  
-- Smart surveillance and safety systems  
+- Safety monitoring and situational awareness  
 - Manufacturing quality control  
 
 ---
