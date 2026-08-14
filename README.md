@@ -4,6 +4,8 @@
 ### Real-Time Video-to-Knowledge Engine for Edge AI
 ### *"Video-to-Knowledge, not Video-to-Identity."*
 
+[![CI](https://github.com/mmartign/Video-to-Knowledge/actions/workflows/ci.yml/badge.svg)](https://github.com/mmartign/Video-to-Knowledge/actions/workflows/ci.yml)
+
 **SI-Watcher** is an edge-first, real-time **video-to-knowledge pipeline** designed to transform live or recorded video streams into **structured, actionable insights** using **multimodal Generative AI**—securely, locally, and with ultra-low latency.
 
 The system has been **explicitly designed for healthcare applications**, where privacy, reliability, and real-time decision support are critical, and has been **tested and validated with the MedGemma-1.5:4b multimodal model** for medical-grade vision-language inference.
@@ -212,6 +214,41 @@ parsing) lives in `pipeline_core.{h,cpp}` and is covered by the unit test
 suite in `tests/`. Set `-DVTK_BUILD_TESTS=OFF` to skip building tests. A
 [GitHub Actions workflow](.github/workflows/ci.yml) builds and runs the test
 suite on every push and pull request.
+
+### Relevance to EU AI Act obligations
+
+This is **not** a legal compliance assessment, and using SI-Watcher does not
+by itself make any given deployment compliant with the EU AI Act (Regulation
+(EU) 2024/1689). Risk classification depends on the specific deployment's
+intended purpose and is the deployer's/provider's responsibility.
+
+Where SI-Watcher is used within a system that falls under the Act's
+high-risk provisions (Chapter III — e.g. via Annex III, or as a safety
+component of a product already covered by Annex I legislation such as the
+Medical Device Regulation), the automated test suite and CI pipeline in this
+repository provide supporting technical evidence for two obligations placed
+on providers of high-risk AI systems:
+
+- **Article 15 (accuracy, robustness and cybersecurity)** — high-risk
+  systems must "achieve an appropriate level of accuracy, robustness, and
+  cybersecurity, and perform consistently in those respects throughout
+  their lifecycle." The unit test suite (`tests/`) and the CI workflow that
+  runs it on every change give a repeatable, automated check of that
+  consistency for the pipeline's core logic (config/CLI parsing, timestamp
+  handling, API response parsing).
+- **Article 17 (quality management system)** — providers must document
+  "testing and validation procedures" as part of a quality management
+  system covering the AI system's lifecycle. `.github/workflows/ci.yml` and
+  `tests/test_pipeline_core.cpp` are one concrete, version-controlled
+  instance of such a procedure.
+
+These practices address the *testing and robustness* dimension of the Act.
+They do not, on their own, satisfy data governance (Article 10), risk
+management (Article 9), technical documentation (Article 11), human
+oversight (Article 14), or conformity assessment/CE marking obligations,
+all of which remain the deployer's/provider's responsibility. See also
+[Privacy-by-Design and No Biometric Identification](#privacy-by-design-and-no-biometric-identification)
+above.
 
 ---
 
