@@ -192,6 +192,29 @@ Analyze this frame. Wall time: 30.000s; media position: 30.000s; interval #3
 
 ---
 
+## Building and testing
+
+The build is CMake-based. OpenCV and libcurl must be installed on the host;
+[nlohmann/json](https://github.com/nlohmann/json) and the
+[Catch2](https://github.com/catchorg/Catch2) test framework are fetched
+automatically. The [openai-cpp](https://github.com/olrea/openai-cpp) headers
+are expected as a sibling checkout at `../openai-cpp` (only needed to build
+`realtime_video_pipeline.exe`, not the tests).
+
+```sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Dependency-light logic (INI/CLI parsing, string/date helpers, API response
+parsing) lives in `pipeline_core.{h,cpp}` and is covered by the unit test
+suite in `tests/`. Set `-DVTK_BUILD_TESTS=OFF` to skip building tests. A
+[GitHub Actions workflow](.github/workflows/ci.yml) builds and runs the test
+suite on every push and pull request.
+
+---
+
 ## Example use case (healthcare monitoring)
 
 1. A camera observes a clinical or laboratory environment  
