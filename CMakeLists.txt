@@ -35,8 +35,26 @@ find_package(CURL REQUIRED)
 
 # Dependency-light logic (INI/CLI parsing, string/date helpers, API response
 # parsing) shared by the executables and covered by unit tests. Deliberately
-# has no OpenCV/CURL/openai-cpp dependency.
-add_library(pipeline_core STATIC pipeline_core.cpp pipeline_core.h)
+# has no OpenCV/CURL/openai-cpp dependency. Split by functional area under
+# pipeline_core/; pipeline_core.h aggregates it for callers that want the
+# full surface.
+add_library(pipeline_core STATIC
+  pipeline_core.h
+  pipeline_core/base64.cpp
+  pipeline_core/base64.h
+  pipeline_core/cli.cpp
+  pipeline_core/cli.h
+  pipeline_core/datetime.cpp
+  pipeline_core/datetime.h
+  pipeline_core/ini_config.cpp
+  pipeline_core/ini_config.h
+  pipeline_core/json_response.cpp
+  pipeline_core/json_response.h
+  pipeline_core/numeric.cpp
+  pipeline_core/numeric.h
+  pipeline_core/strings.cpp
+  pipeline_core/strings.h
+)
 target_include_directories(pipeline_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(pipeline_core PUBLIC nlohmann_json::nlohmann_json)
 
@@ -85,7 +103,16 @@ if(VTK_BUILD_TESTS)
   )
   FetchContent_MakeAvailable(Catch2)
 
-  add_executable(pipeline_core_tests tests/test_pipeline_core.cpp)
+  add_executable(pipeline_core_tests
+    tests/test_utils.h
+    tests/test_base64.cpp
+    tests/test_cli.cpp
+    tests/test_datetime.cpp
+    tests/test_ini_config.cpp
+    tests/test_json_response.cpp
+    tests/test_numeric.cpp
+    tests/test_strings.cpp
+  )
   target_link_libraries(pipeline_core_tests PRIVATE pipeline_core Catch2::Catch2WithMain)
 
   list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
