@@ -69,3 +69,11 @@ TEST_CASE("extractMessageText returns empty string for unrecognized shapes", "[j
     const json emptyChoices = {{"choices", json::array()}};
     REQUIRE(extractMessageText(emptyChoices).empty());
 }
+
+TEST_CASE("looksUndispatched flags an empty or mismatched echoed model", "[json]")
+{
+    REQUIRE(looksUndispatched({{"model", ""}}, "medgemma-15:4b"));
+    REQUIRE(looksUndispatched({{"model", "some-other-model"}}, "medgemma-15:4b"));
+    REQUIRE(looksUndispatched(json::object(), "medgemma-15:4b"));  // field missing entirely
+    REQUIRE_FALSE(looksUndispatched({{"model", "medgemma-15:4b"}}, "medgemma-15:4b"));
+}

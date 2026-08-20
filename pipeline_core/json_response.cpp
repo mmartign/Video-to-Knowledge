@@ -80,4 +80,10 @@ std::string extractMessageText(const json& response)
     return {};
 }
 
+bool looksUndispatched(const json& response, const std::string& requestedModel)
+{
+    const std::string echoedModel = response.value("model", std::string());
+    return echoedModel.empty() || echoedModel != requestedModel;
+}
+
 }  // namespace pipeline_core

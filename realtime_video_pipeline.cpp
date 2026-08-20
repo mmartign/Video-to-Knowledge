@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <csignal>
 #include <cctype>
 #include <cstdint>
 #include <ctime>
@@ -220,7 +221,22 @@ static bool openCapture(cv::VideoCapture& cap, const std::string& src)
     if (isCameraIndexSource(src)) {
         try {
             const int index = std::stoi(src);
+
+            // Request a specific platform backend instead of the default
+            // CAP_ANY, which makes OpenCV probe backends in priority
+            // order. On some platform/camera-driver combinations, a
+            // backend tried before reaching a working one can block
+            // indefinitely instead of failing fast, hanging cap.open()
+            // with no diagnostic output.
+#if defined(_WIN32)
+            return cap.open(index, cv::CAP_DSHOW);
+#elif defined(__APPLE__)
+            return cap.open(index, cv::CAP_AVFOUNDATION);
+#elif defined(__linux__)
+            return cap.open(index, cv::CAP_V4L2);
+#else
             return cap.open(index);
+#endif
         } catch (...) {
             return false;
         }
@@ -301,12 +317,73 @@ static bool sendFrameToOpenAI(
     }
 
     try {
-        auto chat = openai::chat().create(body);
-        const std::string message = extractMessageText(chat);
+        // A response that looks undispatched (see looksUndispatched()) is
+        // the signature of a backend orchestration bug rather than a
+        // model that ran and legitimately produced no text -- observed
+        // with an Open WebUI backend returning an HTTP 200 stub
+        // completion (empty content, all-zero usage, no echoed model)
+        // without ever calling the underlying model. That's plausibly
+        // transient, so retry a couple of times before giving up.
+        constexpr int kMaxAttempts = 3;
+        constexpr auto kRetryDelay = std::chrono::milliseconds(300);
+
+        json chat;
+        std::string message;
+        bool undispatched = false;
+
+        for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+            chat = openai::chat().create(body);
+            message = extractMessageText(chat);
+            if (!message.empty()) {
+                break;
+            }
+
+            undispatched = looksUndispatched(chat, cfg.vmodelName);
+            if (!undispatched || attempt == kMaxAttempts) {
+                break;
+            }
+
+            std::cerr << "[WARN] Interval #" << triggerIdx << " attempt " << attempt
+                      << "/" << kMaxAttempts << ": backend didn't dispatch the request "
+                         "to any model (echoed model=\"" << chat.value("model", std::string())
+                      << "\"); retrying...\n";
+            std::this_thread::sleep_for(kRetryDelay);
+        }
+
         if (!message.empty()) {
             std::cout << message << std::endl;
+            return true;
+        }
+
+        std::cout << "(no text content)" << std::endl;
+
+        // extractMessageText() didn't recognize any of the response
+        // shapes it knows about (or the model/backend genuinely returned
+        // an empty message). Dump the raw response so this is
+        // diagnosable without reproducing the request by hand; capped to
+        // avoid flooding stderr if a backend ever echoes something large
+        // (e.g. the request body) back in the response.
+        std::string dump = chat.dump();
+        constexpr size_t kMaxDumpLen = 4000;
+        if (dump.size() > kMaxDumpLen) {
+            dump.resize(kMaxDumpLen);
+            dump += " ...[truncated]";
+        }
+
+        if (undispatched) {
+            std::cerr << "[ERROR] Interval #" << triggerIdx
+                      << ": backend accepted the request but doesn't appear to have "
+                         "run any model after " << kMaxAttempts << " attempt(s) "
+                         "(requested model=\"" << cfg.vmodelName
+                      << "\", server echoed model=\"" << chat.value("model", std::string()) << "\"). "
+                         "This almost always means \"" << cfg.vmodelName
+                      << "\" isn't a model name the backend at " << cfg.baseUrl
+                      << " recognizes -- double-check vmodel_name in config.ini "
+                         "exactly matches an available, vision-capable model on "
+                         "that server. Raw response: " << dump << "\n";
         } else {
-            std::cout << "(no text content)" << std::endl;
+            std::cerr << "[WARN] Interval #" << triggerIdx
+                      << " got an empty message; raw response: " << dump << "\n";
         }
         return true;
     } catch (const std::exception& e) {
@@ -320,9 +397,32 @@ static bool sendFrameToOpenAI(
 // Main
 //------------------------------------------------------------------------------
 
+// Set by the SIGINT/SIGTERM handler below (e.g. Ctrl+C, or `kill`/`killall`,
+// which sends SIGTERM by default) and polled by the main loop and capture
+// thread. File-scope so the signal handler -- which must be a plain
+// function, not a capturing lambda -- can reach it. This lets the process
+// run its normal shutdown path (releasing the camera, closing the GUI
+// window, joining threads) instead of dying mid-syscall and potentially
+// leaving the camera device locked for the next run.
+//
+// Note: this cannot help if the process is stuck in an uninterruptible
+// native call (e.g. a wedged AVFoundation camera-enumeration call on
+// macOS); SIGKILL (`kill -9`) bypasses this entirely by design, since no
+// user-space handler can intercept it.
+static std::atomic<bool> running{true};
+
+static void handleShutdownSignal(int /*signum*/)
+{
+    // Async-signal-safe: touches only a lock-free atomic<bool>.
+    running.store(false);
+}
+
 // Entry point wiring capture, scheduling, and inference worker threads.
 int main(int argc, char** argv)
 {
+    std::signal(SIGINT, handleShutdownSignal);
+    std::signal(SIGTERM, handleShutdownSignal);
+
     ProgramOptions options;
     if (!parseCommandLine(argc, argv, options)) {
         return 1;
@@ -345,6 +445,27 @@ int main(int argc, char** argv)
                   << e.what() << "\n";
         return 1;
     }
+
+    // Printed before the (potentially slow, and on some platform/backend
+    // combinations previously hang-prone -- see openCapture()) blocking
+    // call below, so a stall is immediately visible as "stuck opening the
+    // source" instead of looking identical to complete silence.
+    std::string openingMsg = "[INFO] Opening video source...";
+#if defined(__APPLE__)
+    // macOS grants camera access per-executable-path, so a freshly built
+    // binary at a new path gets its own first-run permission prompt. If
+    // that dialog doesn't get focus (hidden behind another window/Space),
+    // the underlying AVFoundation call blocks indefinitely waiting for a
+    // decision that never comes -- indistinguishable from a hang unless
+    // the user knows to look for it.
+    if (isCameraIndexSource(options.src)) {
+        openingMsg +=
+            " (macOS may show a camera permission dialog on first run for "
+            "this exact binary -- if this hangs here, check for a hidden "
+            "dialog, or System Settings > Privacy & Security > Camera)";
+    }
+#endif
+    std::cerr << openingMsg << "\n";
 
     cv::VideoCapture cap;
     if (!openCapture(cap, options.src) || !cap.isOpened()) {
@@ -406,8 +527,6 @@ int main(int argc, char** argv)
     std::mutex jobMtx;
     std::condition_variable jobCv;
     PendingJob pending;
-
-    std::atomic<bool> running{true};
 
     //--------------------------------------------------------------------------
     // Worker thread
