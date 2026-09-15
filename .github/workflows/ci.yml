@@ -49,3 +49,35 @@ jobs:
       - name: Run unit tests
         working-directory: Video-to-Knowledge
         run: ctest --test-dir build --output-on-failure
+
+  drone-build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev \
+            ninja-build
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: drone/build/_deps
+          key: ${{ runner.os }}-drone-fetchcontent-${{ hashFiles('drone/CMakeLists.txt') }}
+
+      - name: Configure
+        working-directory: drone
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        working-directory: drone
+        run: cmake --build build
+
+      - name: Run unit tests
+        working-directory: drone
+        run: ctest --test-dir build --output-on-failure
