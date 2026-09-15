@@ -127,8 +127,9 @@ Requires OpenCV on the host (core, imgproc, video, videoio, objdetect);
 nlohmann/json and Catch2 are fetched automatically. Set
 `-DDRONE_BUILD_TESTS=OFF` to skip building tests. One test
 (`CasualtyDetector loads a real Haar cascade...`) needs OpenCV's bundled
-cascade data at a conventional install path and is skipped, not failed,
-if none is found on the host.
+cascade data at a conventional install path and passes trivially without
+testing anything, rather than failing, if none is found on the host --
+e.g. on the CI image, whose `libopencv-dev` doesn't ship that data.
 
 ## Running
 
