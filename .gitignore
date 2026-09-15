@@ -1,1 +1,4 @@
 build/
+
+# Not for commit -- reference material only (see drone/README.md).
+drone/innovation_report.txt
