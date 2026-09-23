@@ -322,14 +322,25 @@ static bool sendFrameToOpenAI(
         // model that ran and legitimately produced no text -- observed
         // with an Open WebUI backend returning an HTTP 200 stub
         // completion (empty content, all-zero usage, no echoed model)
-        // without ever calling the underlying model. That's plausibly
-        // transient, so retry a couple of times before giving up.
+        // without ever calling the underlying model. Root-caused to
+        // Ollama itself serializing/queueing requests: it processes one
+        // generation per model at a time by default (OLLAMA_NUM_PARALLEL),
+        // so if anything else was using the same Ollama instance when
+        // this request landed, it can sit blocked for several seconds
+        // (loading a model, or working through a prior queued request)
+        // before Open WebUI's wrapper gives up and returns this stub
+        // instead of actually waiting. That needs real wall-clock time to
+        // clear, not milliseconds, hence exponential backoff starting at
+        // a full second rather than a fixed short delay -- three attempts
+        // spaced 300ms apart previously had no realistic chance of
+        // landing after Ollama had actually finished.
         constexpr int kMaxAttempts = 3;
-        constexpr auto kRetryDelay = std::chrono::milliseconds(300);
+        constexpr auto kInitialRetryDelay = std::chrono::seconds(1);
 
         json chat;
         std::string message;
         bool undispatched = false;
+        auto retryDelay = kInitialRetryDelay;
 
         for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
             chat = openai::chat().create(body);
@@ -346,8 +357,11 @@ static bool sendFrameToOpenAI(
             std::cerr << "[WARN] Interval #" << triggerIdx << " attempt " << attempt
                       << "/" << kMaxAttempts << ": backend didn't dispatch the request "
                          "to any model (echoed model=\"" << chat.value("model", std::string())
-                      << "\"); retrying...\n";
-            std::this_thread::sleep_for(kRetryDelay);
+                      << "\"); retrying in "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(retryDelay).count()
+                      << "ms...\n";
+            std::this_thread::sleep_for(retryDelay);
+            retryDelay *= 2;
         }
 
         if (!message.empty()) {
