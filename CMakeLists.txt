@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(VTK_BUILD_TESTS "Build the pipeline_core unit test suite" ON)
 
 include(FetchContent)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 # nlohmann/json is needed by pipeline_core (API response parsing) as well as
 # by the main pipeline executable, which also sees openai-cpp's own vendored
