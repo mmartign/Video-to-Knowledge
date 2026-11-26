@@ -36,32 +36,33 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::json;
 using namespace pipeline_core;
 
-// Single-slot job exchanged between the main thread and the inference worker.
+// Single-slot job exchanged between the main scheduling loop and the worker.
 //
 // Design choice:
-// - We keep only one pending job.
-// - Newer frames overwrite older pending work.
-// - This keeps the pipeline responsive for live streams and prevents latency
-//   from growing without bound under slow inference.
+// - Only one inference call may execute at a time (`inFlight`).
+// - While a job is pending or in flight, new interval ticks are skipped so
+//   requests never pile up in the backend queue.
 struct PendingJob {
     cv::Mat frame;
     double wallTimeSec = 0.0;   // elapsed program time when the trigger fired
     double mediaPosSec = 0.0;   // position in the media timeline, if known
     int triggerIdx = 0;
-    bool has = false;
-    bool stop = false;
+    bool has = false;           // true when a job is waiting for the worker
+    bool inFlight = false;      // true while an inference call is active
+    bool stop = false;          // signals the worker thread to exit
 };
 
 //------------------------------------------------------------------------------
 // Utility helpers
 //------------------------------------------------------------------------------
 
-// Simple RAII joiner to ensure threads are joined on all exit paths.
+// RAII wrapper to guarantee std::thread objects are joined on all exit paths.
 class ThreadJoiner {
 public:
     explicit ThreadJoiner(std::thread& t) noexcept : thread_(t) {}
@@ -78,14 +79,29 @@ private:
     std::thread& thread_;
 };
 
-// The following pure helpers now live in pipeline_core.h/.cpp so they can be
-// unit tested without linking OpenCV/CURL/openai-cpp:
-// printUsage, trimInPlace, parseIni, ensureTrailingSlash, endsWith,
-// toLowerAscii, usesOpenWebUIChatEndpoint, loadOpenAIConfig, base64Encode,
-// extractMessageText, safeLocalTime, safeUtcTime, formatDateTime,
-// formatDateTimeNoConversion, parseDateTime, DateTimeParts, parseNDigits,
-// isLeapYear, daysInMonth, parseDateTimeParts, daysFromCivil,
-// parseDateTimeNoConversion, parseMetadataDateTime.
+// Format a duration in seconds as "HH:MM:SS.mmm (Xs)" so the LLM does not
+// have to perform error-prone mental division on raw second counts.
+static std::string formatDurationWithHours(double totalSec)
+{
+    if (!std::isfinite(totalSec) || totalSec < 0.0) {
+        totalSec = 0.0;
+    }
+
+    const long long totalMs = std::llround(totalSec * 1000.0);
+    const long long hours = totalMs / 3600000;
+    const long long minutes = (totalMs % 3600000) / 60000;
+    const long long seconds = (totalMs % 60000) / 1000;
+    const long long millis = totalMs % 1000;
+
+    std::ostringstream oss;
+    oss << std::setfill('0')
+        << std::setw(2) << hours << ":"
+        << std::setw(2) << minutes << ":"
+        << std::setw(2) << seconds << "."
+        << std::setw(3) << millis
+        << " (" << std::fixed << std::setprecision(3) << totalSec << "s)";
+    return oss.str();
+}
 
 // Probe ffprobe start_time_realtime (microseconds since epoch) for media files.
 static std::optional<std::chrono::system_clock::time_point>
@@ -140,7 +156,7 @@ probeFileEncodedTimelineStart(const std::string& path)
     return std::nullopt;
 }
 
-// Probe ffprobe creation_time tags and parse to local system_clock time.
+// Probe ffprobe creation_time metadata tags and parse into a system_clock time_point.
 static std::optional<std::chrono::system_clock::time_point>
 probeFileEncodedStartTime(const std::string& path)
 {
@@ -191,8 +207,8 @@ probeFileEncodedStartTime(const std::string& path)
 // Frame/image helpers
 //------------------------------------------------------------------------------
 
-// Resize a frame so that max(width, height) <= maxDim, preserving aspect ratio.
-// If maxDim <= 0, resizing is disabled.
+// Downscale a frame so max(width, height) <= maxDim while preserving aspect ratio.
+// Returns the original frame unmodified if maxDim <= 0 or already within bounds.
 static cv::Mat resizeMaxDim(const cv::Mat& frame, int maxDim)
 {
     if (maxDim <= 0 || frame.empty()) {
@@ -215,19 +231,13 @@ static cv::Mat resizeMaxDim(const cv::Mat& frame, int maxDim)
     return resized;
 }
 
-// Open either a camera index or a URI/file path.
+// Open either a numeric camera index (using an explicit platform backend to
+// avoid slow/hanging CAP_ANY probing) or a file path / stream URI.
 static bool openCapture(cv::VideoCapture& cap, const std::string& src)
 {
     if (isCameraIndexSource(src)) {
         try {
             const int index = std::stoi(src);
-
-            // Request a specific platform backend instead of the default
-            // CAP_ANY, which makes OpenCV probe backends in priority
-            // order. On some platform/camera-driver combinations, a
-            // backend tried before reaching a working one can block
-            // indefinitely instead of failing fast, hanging cap.open()
-            // with no diagnostic output.
 #if defined(_WIN32)
             return cap.open(index, cv::CAP_DSHOW);
 #elif defined(__APPLE__)
@@ -245,19 +255,58 @@ static bool openCapture(cv::VideoCapture& cap, const std::string& src)
 }
 
 //------------------------------------------------------------------------------
-// OpenAI request
+// OpenAI response parsing & request handling
 //------------------------------------------------------------------------------
 
-// Encode a frame as JPEG, wrap it into a data URL, and send it to the model.
-//
-// We include both:
-// - wall time: how long the program has been running
-// - media position: where the frame sits in the media timeline
-//
-// Keeping those separate matters for offline file playback, where media time
-// should not drift if inference becomes slower or faster.
+// Extract the assistant's text from `choices[0].message.content` (supporting
+// both plain string and segmented array formats), falling back to
+// pipeline_core::extractMessageText() for non-standard server envelopes.
+static std::string extractChatContent(const json& chat)
+{
+    if (chat.contains("choices") && chat["choices"].is_array() && !chat["choices"].empty()) {
+        const auto& choice0 = chat["choices"][0];
+        if (choice0.is_object() && choice0.contains("message") && choice0["message"].is_object()) {
+            const auto& msg = choice0["message"];
+            if (msg.contains("content")) {
+                const auto& content = msg["content"];
+                if (content.is_string()) {
+                    std::string text = content.get<std::string>();
+                    trimInPlace(text);
+                    if (!text.empty()) {
+                        return text;
+                    }
+                } else if (content.is_array()) {
+                    std::string combined;
+                    for (const auto& part : content) {
+                        if (part.is_object() &&
+                            part.value("type", "") == "text" &&
+                            part.contains("text") &&
+                            part["text"].is_string()) {
+                            if (!combined.empty()) {
+                                combined += "\n";
+                            }
+                            combined += part["text"].get<std::string>();
+                        }
+                    }
+                    trimInPlace(combined);
+                    if (!combined.empty()) {
+                        return combined;
+                    }
+                }
+            }
+        }
+    }
+
+    std::string fallback = extractMessageText(chat);
+    trimInPlace(fallback);
+    return fallback;
+}
+
+// Encode a frame as a base64 JPEG data URL, send it to the configured chat
+// completions endpoint, and write the extracted content field to stdout.
 static bool sendFrameToOpenAI(
     const cv::Mat& frame,
+    bool isFileSource,
     double wallTimeSec,
     double mediaPosSec,
     int triggerIdx,
@@ -282,12 +331,21 @@ static bool sendFrameToOpenAI(
 
     const std::string dataUrl = "data:image/jpeg;base64," + base64Encode(buffer);
 
+    // For recorded files, pass only the media timeline position (formatted as
+    // HH:MM:SS.mmm alongside seconds) so decoding drift never misleads the
+    // model into thinking the frame came from beyond the end of the file.
+    // For live streams/cameras without a fixed timeline, include wall time.
     std::ostringstream promptStream;
-    promptStream
-        << prompt
-        << " Wall time: " << std::fixed << std::setprecision(3) << wallTimeSec << "s;"
-        << " media position: " << std::fixed << std::setprecision(3) << mediaPosSec << "s;"
-        << " interval #" << triggerIdx;
+    promptStream << prompt;
+    if (isFileSource) {
+        promptStream << " Media position: " << formatDurationWithHours(mediaPosSec) << ";";
+    } else {
+        promptStream << " Elapsed stream time: " << formatDurationWithHours(wallTimeSec) << ";";
+        if (mediaPosSec > 0.0) {
+            promptStream << " media position: " << formatDurationWithHours(mediaPosSec) << ";";
+        }
+    }
+    promptStream << " interval #" << triggerIdx;
 
     json body = {
         {"model", cfg.vmodelName},
@@ -303,37 +361,10 @@ static bool sendFrameToOpenAI(
         {"stream", false}
     };
 
-    if (usesOpenWebUIChatEndpoint(cfg.baseUrl)) {
-        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        const std::string requestId =
-            "realtime-video-" + std::to_string(nowMs) + "-" + std::to_string(triggerIdx);
-
-        // Open WebUI's /api chat route assumes metadata.chat_id is a string
-        // during response post-processing. Supplying a local chat id avoids a
-        // server-side None.startswith() failure for direct API callers.
-        body["chat_id"] = "local:" + requestId;
-        body["id"] = "msg-" + requestId;
-    }
-
     try {
-        // A response that looks undispatched (see looksUndispatched()) is
-        // the signature of a backend orchestration bug rather than a
-        // model that ran and legitimately produced no text -- observed
-        // with an Open WebUI backend returning an HTTP 200 stub
-        // completion (empty content, all-zero usage, no echoed model)
-        // without ever calling the underlying model. Root-caused to
-        // Ollama itself serializing/queueing requests: it processes one
-        // generation per model at a time by default (OLLAMA_NUM_PARALLEL),
-        // so if anything else was using the same Ollama instance when
-        // this request landed, it can sit blocked for several seconds
-        // (loading a model, or working through a prior queued request)
-        // before Open WebUI's wrapper gives up and returns this stub
-        // instead of actually waiting. That needs real wall-clock time to
-        // clear, not milliseconds, hence exponential backoff starting at
-        // a full second rather than a fixed short delay -- three attempts
-        // spaced 300ms apart previously had no realistic chance of
-        // landing after Ollama had actually finished.
+        // Retry with exponential backoff only if the backend returns an empty
+        // "undispatched" stub (e.g., when Ollama/Open WebUI drops a request
+        // while busy loading or running a prior generation).
         constexpr int kMaxAttempts = 3;
         constexpr auto kInitialRetryDelay = std::chrono::seconds(1);
 
@@ -344,7 +375,7 @@ static bool sendFrameToOpenAI(
 
         for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
             chat = openai::chat().create(body);
-            message = extractMessageText(chat);
+            message = extractChatContent(chat);
             if (!message.empty()) {
                 break;
             }
@@ -364,19 +395,15 @@ static bool sendFrameToOpenAI(
             retryDelay *= 2;
         }
 
+        // Flush stdout explicitly so output appears immediately even when
+        // piped or redirected to a file.
         if (!message.empty()) {
-            std::cout << message << std::endl;
+            std::cout << message << '\n' << std::flush;
             return true;
         }
 
-        std::cout << "(no text content)" << std::endl;
+        std::cout << "(no text content)\n" << std::flush;
 
-        // extractMessageText() didn't recognize any of the response
-        // shapes it knows about (or the model/backend genuinely returned
-        // an empty message). Dump the raw response so this is
-        // diagnosable without reproducing the request by hand; capped to
-        // avoid flooding stderr if a backend ever echoes something large
-        // (e.g. the request body) back in the response.
         std::string dump = chat.dump();
         constexpr size_t kMaxDumpLen = 4000;
         if (dump.size() > kMaxDumpLen) {
@@ -390,14 +417,11 @@ static bool sendFrameToOpenAI(
                          "run any model after " << kMaxAttempts << " attempt(s) "
                          "(requested model=\"" << cfg.vmodelName
                       << "\", server echoed model=\"" << chat.value("model", std::string()) << "\"). "
-                         "This almost always means \"" << cfg.vmodelName
-                      << "\" isn't a model name the backend at " << cfg.baseUrl
-                      << " recognizes -- double-check vmodel_name in config.ini "
-                         "exactly matches an available, vision-capable model on "
-                         "that server. Raw response: " << dump << "\n";
+                         "Verify vmodel_name in config.ini matches an available vision model "
+                         "on " << cfg.baseUrl << ". Raw response: " << dump << "\n";
         } else {
             std::cerr << "[WARN] Interval #" << triggerIdx
-                      << " got an empty message; raw response: " << dump << "\n";
+                      << " got an empty content field; raw response: " << dump << "\n";
         }
         return true;
     } catch (const std::exception& e) {
@@ -408,30 +432,17 @@ static bool sendFrameToOpenAI(
 }
 
 //------------------------------------------------------------------------------
-// Main
+// Signal handling & entry point
 //------------------------------------------------------------------------------
 
-// Set by the SIGINT/SIGTERM handler below (e.g. Ctrl+C, or `kill`/`killall`,
-// which sends SIGTERM by default) and polled by the main loop and capture
-// thread. File-scope so the signal handler -- which must be a plain
-// function, not a capturing lambda -- can reach it. This lets the process
-// run its normal shutdown path (releasing the camera, closing the GUI
-// window, joining threads) instead of dying mid-syscall and potentially
-// leaving the camera device locked for the next run.
-//
-// Note: this cannot help if the process is stuck in an uninterruptible
-// native call (e.g. a wedged AVFoundation camera-enumeration call on
-// macOS); SIGKILL (`kill -9`) bypasses this entirely by design, since no
-// user-space handler can intercept it.
+// Global flag cleared by SIGINT/SIGTERM to trigger clean thread & device shutdown.
 static std::atomic<bool> running{true};
 
 static void handleShutdownSignal(int /*signum*/)
 {
-    // Async-signal-safe: touches only a lock-free atomic<bool>.
     running.store(false);
 }
 
-// Entry point wiring capture, scheduling, and inference worker threads.
 int main(int argc, char** argv)
 {
     std::signal(SIGINT, handleShutdownSignal);
@@ -447,7 +458,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Log the effective non-secret configuration for easier troubleshooting.
     std::cerr << "[INFO] OpenAI base URL: " << cfg.baseUrl << "\n";
     std::cerr << "[INFO] Vision model: " << cfg.vmodelName << "\n";
     std::cerr << "[INFO] Source: " << options.src << "\n";
@@ -460,18 +470,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Printed before the (potentially slow, and on some platform/backend
-    // combinations previously hang-prone -- see openCapture()) blocking
-    // call below, so a stall is immediately visible as "stuck opening the
-    // source" instead of looking identical to complete silence.
     std::string openingMsg = "[INFO] Opening video source...";
 #if defined(__APPLE__)
-    // macOS grants camera access per-executable-path, so a freshly built
-    // binary at a new path gets its own first-run permission prompt. If
-    // that dialog doesn't get focus (hidden behind another window/Space),
-    // the underlying AVFoundation call blocks indefinitely waiting for a
-    // decision that never comes -- indistinguishable from a hang unless
-    // the user knows to look for it.
     if (isCameraIndexSource(options.src)) {
         openingMsg +=
             " (macOS may show a camera permission dialog on first run for "
@@ -487,13 +487,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Request a small internal buffer to reduce lag on live sources.
+    // Keep internal capture buffering minimal to reduce latency on live sources.
     cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
 
-    // Heuristic:
-    // - if frame count is finite and > 0, and the source is not a camera index,
-    //   treat it as a media file
-    // - otherwise assume a live-ish source
+    // Finite positive frame count on a non-camera source indicates a media file.
     const double frameCount = cap.get(cv::CAP_PROP_FRAME_COUNT);
     const bool likelyFile =
         std::isfinite(frameCount) &&
@@ -502,15 +499,12 @@ int main(int argc, char** argv)
 
     const auto applicationStartTime = std::chrono::system_clock::now();
 
-    // Base timestamp used to map media position -> absolute datetime.
-    //
-    // Priority:
-    // 1. explicit --predefined_start_time
-    // 2. encoded timeline start (start_time_realtime)
-    // 3. encoded start from media metadata (creation_time)
+    // Base timestamp used to map media position to wall-clock datetime:
+    // 1. --predefined_start_time
+    // 2. container/stream start_time_realtime
+    // 3. creation_time metadata tag
     // 4. application start time
-    std::chrono::system_clock::time_point fileBaseTime =
-        applicationStartTime;
+    std::chrono::system_clock::time_point fileBaseTime = applicationStartTime;
 
     if (likelyFile) {
         if (options.hasPredefinedStartTime) {
@@ -528,32 +522,22 @@ int main(int argc, char** argv)
         }
     }
 
-    // Shared latest frame state.
-    //
-    // The capture thread continuously updates this.
-    // The main loop periodically samples it and overwrites the single pending
-    // inference job.
+    // Latest captured frame shared between captureThread and the main loop.
     std::mutex frameMtx;
     cv::Mat latestFrame;
     double latestMediaPosSec = 0.0;
 
-    // Shared job state for the worker thread.
+    // Single-slot job state shared between the main loop and the inference worker.
     std::mutex jobMtx;
     std::condition_variable jobCv;
     PendingJob pending;
 
     //--------------------------------------------------------------------------
-    // Worker thread
+    // Inference worker thread
     //
-    // Responsibilities:
-    // - wait for a pending job
-    // - process only the newest job
-    // - send frame to the model
-    //
-    // Important:
-    // For file playback, encoded timestamps are derived from mediaPosSec,
-    // not wallTimeSec. This avoids drift when inference is slower than real
-    // time or when file playback timing varies.
+    // Executes one vision-language request at a time. While a request is in
+    // flight, `pending.inFlight` remains true so the scheduler will not start
+    // or queue another request until this one completes.
     //--------------------------------------------------------------------------
     std::thread worker([&] {
         while (true) {
@@ -571,10 +555,20 @@ int main(int argc, char** argv)
                 job.triggerIdx = pending.triggerIdx;
                 pending.frame.copyTo(job.frame);
 
-                // Clear the pending slot immediately so that newer work can be
-                // scheduled while inference is running.
                 pending.has = false;
+                pending.inFlight = true;
             }
+
+            // Guarantee `inFlight` is cleared when this iteration finishes,
+            // even if frame validation or network calls exit early.
+            struct InFlightGuard {
+                std::mutex& mtx;
+                bool& flag;
+                ~InFlightGuard() {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    flag = false;
+                }
+            } guard{jobMtx, pending.inFlight};
 
             if (job.frame.empty()) {
                 continue;
@@ -599,18 +593,17 @@ int main(int argc, char** argv)
                                                   ? mediaTag
                                                   : acquisitionTag;
 
-            // For files we log encoded media timeline time; for live sources we
-            // fall back to acquisition time because no stable encoded timeline exists.
             std::cout << logTimestamp
                       << " media-time=" << std::fixed << std::setprecision(3)
                       << job.mediaPosSec << "s";
             if (!useEncodedTimelineTag) {
                 std::cout << " encoded-at=" << mediaTag;
             }
-            std::cout << "  ";
+            std::cout << "  " << std::flush;
 
             sendFrameToOpenAI(
                 job.frame,
+                likelyFile,
                 job.wallTimeSec,
                 job.mediaPosSec,
                 job.triggerIdx,
@@ -625,15 +618,8 @@ int main(int argc, char** argv)
     //--------------------------------------------------------------------------
     // Capture thread
     //
-    // Responsibilities:
-    // - continuously read frames from OpenCV
-    // - keep only the latest frame
-    // - for files, pace playback approximately in real time
-    // - for streams, attempt reconnects on transient failures
-    //
-    // Notes:
-    // - For media files, we prefer CAP_PROP_POS_MSEC as the media timeline.
-    // - If POS_MSEC is unavailable, we fall back to FPS-derived progression.
+    // Continuously reads frames, paces file playback to real time, reconnects
+    // live streams on transient read failures, and publishes the newest frame.
     //--------------------------------------------------------------------------
     std::thread captureThread([&] {
         cv::Mat f;
@@ -665,8 +651,7 @@ int main(int argc, char** argv)
                         mediaPosSec = fallbackPosSec;
                     }
 
-                    // Throttle file reading to approximately real-time playback
-                    // based on media position, not on loop speed.
+                    // Pace file decoding to roughly match real-time playback.
                     if (mediaPosSec > 0.0) {
                         const auto targetTime =
                             playbackStart + std::chrono::duration<double>(mediaPosSec);
@@ -676,8 +661,6 @@ int main(int argc, char** argv)
                         }
                     }
                 } else {
-                    // For streams/cameras, media position is less meaningful.
-                    // Use POS_MSEC only if the backend provides something sane.
                     const double posMsec = cap.get(cv::CAP_PROP_POS_MSEC);
                     if (std::isfinite(posMsec) && posMsec >= 0.0) {
                         mediaPosSec = posMsec / 1000.0;
@@ -694,13 +677,13 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            // For files, EOF/failure is expected termination.
+            // End-of-file for recorded media terminates the application cleanly.
             if (likelyFile) {
                 running.store(false);
                 break;
             }
 
-            // For streams/cameras, treat failures as transient up to a limit.
+            // Live stream / camera failure: retry with bounded backoff up to reconnectSec.
             const auto now = std::chrono::steady_clock::now();
             const double downFor =
                 std::chrono::duration<double>(now - lastOk).count();
@@ -713,8 +696,6 @@ int main(int argc, char** argv)
                 break;
             }
 
-            // Bounded exponential backoff:
-            // 250, 500, 1000, 2000, 2000, ...
             ++reconnectAttempt;
             const int backoffMs =
                 std::min(2000, 250 * (1 << std::min(reconnectAttempt - 1, 3)));
@@ -740,12 +721,11 @@ int main(int argc, char** argv)
     ThreadJoiner captureJoiner(captureThread);
 
     //--------------------------------------------------------------------------
-    // Main scheduling loop
+    // Main scheduling & UI loop
     //
-    // Responsibilities:
-    // - periodically sample the newest available frame
-    // - overwrite the pending single-slot inference job
-    // - optionally display the current frame in a GUI window
+    // Fires at fixed intervals (`options.intervalSec`). If the worker is still
+    // processing the previous frame (`pending.has || pending.inFlight`), the
+    // trigger is skipped so a new analysis is never started prematurely.
     //--------------------------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
     double nextTrigger = 0.0;
@@ -755,45 +735,50 @@ int main(int argc, char** argv)
         const auto tNow = std::chrono::steady_clock::now();
         const double wallSec = std::chrono::duration<double>(tNow - t0).count();
 
-        // Fire at fixed intervals.
-        //
-        // We overwrite the pending job rather than queueing indefinitely,
-        // because freshness matters more than completeness for this workload.
         if (wallSec >= nextTrigger) {
-            cv::Mat frameCopy;
-            double mediaPosSec = 0.0;
-
-            {
-                std::lock_guard<std::mutex> lock(frameMtx);
-                if (!latestFrame.empty()) {
-                    latestFrame.copyTo(frameCopy);
-                }
-                mediaPosSec = latestMediaPosSec;
+            // Advance the schedule immediately so skipped ticks do not spin.
+            while (wallSec >= nextTrigger) {
+                nextTrigger += options.intervalSec;
             }
 
-            if (!frameCopy.empty()) {
-                {
-                    std::lock_guard<std::mutex> lk(jobMtx);
-                    pending.frame = frameCopy;
-                    pending.wallTimeSec = wallSec;
-                    pending.mediaPosSec = mediaPosSec;
-                    pending.triggerIdx = triggerIdx++;
-                    pending.has = true;
-                }
-                jobCv.notify_one();
+            bool workerBusy = false;
+            {
+                std::lock_guard<std::mutex> lk(jobMtx);
+                workerBusy = pending.has || pending.inFlight;
+            }
 
-                // If the main loop was delayed, catch up by advancing the next
-                // trigger beyond the current wall time.
-                while (wallSec >= nextTrigger) {
-                    nextTrigger += options.intervalSec;
+            if (!workerBusy) {
+                cv::Mat frameCopy;
+                double mediaPosSec = 0.0;
+
+                {
+                    std::lock_guard<std::mutex> lock(frameMtx);
+                    if (!latestFrame.empty()) {
+                        latestFrame.copyTo(frameCopy);
+                    }
+                    mediaPosSec = latestMediaPosSec;
+                }
+
+                if (!frameCopy.empty()) {
+                    bool scheduled = false;
+                    {
+                        std::lock_guard<std::mutex> lk(jobMtx);
+                        if (!pending.has && !pending.inFlight) {
+                            pending.frame = std::move(frameCopy);
+                            pending.wallTimeSec = wallSec;
+                            pending.mediaPosSec = mediaPosSec;
+                            pending.triggerIdx = triggerIdx++;
+                            pending.has = true;
+                            scheduled = true;
+                        }
+                    }
+                    if (scheduled) {
+                        jobCv.notify_one();
+                    }
                 }
             }
         }
 
-        // Optional local preview window.
-        //
-        // This is deliberately non-blocking: waitKey(1) allows GUI events to be
-        // processed without stalling capture/inference scheduling.
         if (options.guiEnabled) {
             cv::Mat toShow;
             {
@@ -812,14 +797,11 @@ int main(int argc, char** argv)
             }
         }
 
-        // Small sleep to avoid a busy-spin main loop.
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     //--------------------------------------------------------------------------
-    // Shutdown
-    //
-    // Signal the worker explicitly instead of faking a pending job.
+    // Clean shutdown
     //--------------------------------------------------------------------------
     {
         std::lock_guard<std::mutex> lk(jobMtx);
